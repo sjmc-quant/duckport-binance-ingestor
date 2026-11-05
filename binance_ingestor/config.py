@@ -51,20 +51,18 @@ CONCURRENCY = int(os.getenv('CONCURRENCY', 2))
 FETCH_CONCURRENCY = min(CONCURRENCY, 10)
 
 # ── WebSocket batch remedy ────────────────────────────────────────────
-# A bar's closed candles normally all arrive within ~3s of the close. When a
-# listener group drops right then, its symbols never arrive and the bar would
-# only be written by the next bar's remedy, a whole interval late. After this
-# many seconds an incomplete batch is completed over REST instead.
-BATCH_REMEDY_WAIT_SEC = float(os.getenv("BATCH_REMEDY_WAIT_SEC", 8))
+# Off by default. When enabled, a close whose duck_time is more than one bar
+# behind goes straight to the full REST remedy. An adjacent bar waits this many
+# seconds; if the websocket batch is still incomplete, the missing symbols are
+# filled over REST and written only when every symbol for that close is present.
+ENABLE_BATCH_REMEDY = os.getenv("ENABLE_BATCH_REMEDY", "false").lower() == "true"
+BATCH_REMEDY_WAIT_SEC = float(os.getenv("BATCH_REMEDY_WAIT_SEC", "8"))
 if not 0 < BATCH_REMEDY_WAIT_SEC < KLINE_INTERVAL_MINUTES * 60:
     raise ValueError(f"BATCH_REMEDY_WAIT_SEC must be between 0 and the bar length "
                      f"({KLINE_INTERVAL_MINUTES * 60}s), got {BATCH_REMEDY_WAIT_SEC}")
-# How long the REST fetch of the missing symbols may take; symbols still in flight
-# after this are written by the next bar's full remedy (~1s normally, a symbol that
-# keeps failing backs off for ~96s and would otherwise hold the whole bar).
-BATCH_REMEDY_FETCH_SEC = float(os.getenv("BATCH_REMEDY_FETCH_SEC", 30))
-# Upper bound for one whole remedy (REST fetch + write) before giving up on it.
-BATCH_REMEDY_TIMEOUT_SEC = float(os.getenv("BATCH_REMEDY_TIMEOUT_SEC", 120))
+# Internal deadline for the missing-symbol REST fetch. A symbol stuck in retry
+# back-off must not hold the bar. Not a plugin setting.
+BATCH_REMEDY_FETCH_SEC = 30
 
 # ── Data sources ──────────────────────────────────────────────────────
 DATA_SOURCES_STR = os.getenv('DATA_SOURCES', 'usdt_perp,usdt_spot')

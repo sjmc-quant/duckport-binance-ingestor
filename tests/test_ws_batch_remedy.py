@@ -1,5 +1,7 @@
-"""WebSocket batch watchdog: a candle batch still incomplete ``BATCH_REMEDY_WAIT_SEC`` after
-the bar close is completed over REST right away instead of by the next bar's remedy.
+"""WebSocket batch remedy. A close more than one bar behind duck_time goes straight to
+the full REST remedy. An adjacent close waits ``BATCH_REMEDY_WAIT_SEC``; if the batch
+is still incomplete, missing symbols are filled over REST and written only when the
+closed bar is complete.
 
 Run with ``PYTHONPATH=. pytest tests``.
 """
@@ -12,9 +14,10 @@ import pytest
 import pytz
 
 from binance_ingestor import data_jobs
-from binance_ingestor.component import candle_listener
+from binance_ingestor.api.ws_basics import ReconnectingWebsocket, WSListenerState
 from binance_ingestor.component.candle_fetcher import OptimizedKlineFetcher
 from binance_ingestor.component.candle_listener import MarketListener
+from binance_ingestor.config import FETCH_CONCURRENCY
 from binance_ingestor.data_jobs import WebsocketsDataJobs
 
 RT = pd.Timestamp("2026-11-05 01:40:00", tz="UTC")
@@ -113,28 +116,115 @@ def test_batch_without_any_candle_is_remedied_in_full():
     asyncio.run(run())
 
 
-def test_remedy_errors_and_timeouts_do_not_escape(monkeypatch):
+def test_remedy_errors_do_not_escape():
     calls = []
 
     async def failing(run_time, partial, missing, market):
         calls.append("fail")
         raise RuntimeError("boom")
 
-    async def hanging(run_time, partial, missing, market):
-        calls.append("hang")
-        await asyncio.sleep(5)
-
-    monkeypatch.setattr(candle_listener, "BATCH_REMEDY_TIMEOUT_SEC", 0.05)
-
     async def run():
-        for cb, rt in ((failing, RT), (hanging, RT + INTERVAL)):
-            listener = MarketListener(MARKET, remedy_callback=cb)
-            listener.symbols = {"A"}
-            assert await listener.remedy_incomplete(rt) is True
-            assert rt in listener._settled
+        listener = MarketListener(MARKET, remedy_callback=failing)
+        listener.symbols = {"A"}
+        assert await listener.remedy_incomplete(RT) is True
+        assert RT in listener._settled
 
     asyncio.run(run())
-    assert calls == ["fail", "hang"]
+    assert calls == ["fail"]
+
+
+def test_gap_at_close_runs_full_remedy_and_does_not_wait():
+    full_calls = []
+    partial_calls = []
+
+    async def full(run_time, market):
+        full_calls.append((pd.Timestamp(run_time), market))
+
+    async def partial(run_time, partial_batch, missing, market):
+        partial_calls.append(market)
+
+    listener = MarketListener(
+        MARKET, remedy_callback=partial, full_remedy_callback=full, gap_callback=lambda run_time, market: True,
+    )
+    listener.symbols = {"A", "B", "C"}
+
+    async def run():
+        await listener._handle_candle(ws_req("A"))
+        assert await listener.on_bar_close(RT) == "full"
+        assert full_calls == [(RT, MARKET)]
+        assert partial_calls == []
+        assert listener._settled[RT] == "full"
+        assert RT not in listener._data_batches
+        await listener._handle_candle(ws_req("B"))
+        assert await listener.remedy_incomplete(RT) is False
+        assert partial_calls == []
+
+    asyncio.run(run())
+
+
+def test_adjacent_close_waits_and_does_not_remedy_yet():
+    called = []
+
+    async def full(run_time, market):
+        called.append("full")
+
+    async def partial(run_time, partial_batch, missing, market):
+        called.append("partial")
+
+    listener = MarketListener(
+        MARKET, remedy_callback=partial, full_remedy_callback=full, gap_callback=lambda run_time, market: False,
+    )
+    listener.symbols = {"A"}
+
+    async def run():
+        assert await listener.on_bar_close(RT) == "wait"
+        assert called == []
+        assert RT not in listener._settled
+
+    asyncio.run(run())
+
+
+class FakeGroup:
+    def __init__(self):
+        self.forced = 0
+
+    async def force_reconnect(self):
+        self.forced += 1
+
+
+def test_incomplete_batch_reconnects_only_missing_groups():
+    remedies = []
+
+    async def remedy_cb(run_time, partial, missing, market):
+        remedies.append(set(missing))
+
+    listener = MarketListener(MARKET, remedy_callback=remedy_cb)
+    listener.symbols = {"A", "B", "C"}
+    groups = {i: FakeGroup() for i in range(FETCH_CONCURRENCY)}
+    listener.listeners = groups
+
+    async def run():
+        await listener._handle_candle(ws_req("A"))
+        await listener._handle_candle(ws_req("B"))
+        assert await listener.remedy_incomplete(RT) is True
+
+    asyncio.run(run())
+    assert remedies == [{"C"}]
+    missing_group = hash("C") % FETCH_CONCURRENCY
+    assert groups[missing_group].forced == 1
+    assert sum(group.forced for group in groups.values()) == 1
+
+
+def test_force_disconnect_unblocks_recv_with_sentinel():
+    socket = ReconnectingWebsocket(url="wss://example.invalid/", path="btcusdt@kline_5m")
+
+    async def run():
+        await socket.force_disconnect()
+        assert socket.ws_state == WSListenerState.EXITING
+        message = await asyncio.wait_for(socket.recv(), timeout=1)
+        assert message == {"e": "forced_reconnect"}
+
+    asyncio.run(run())
 
 
 def test_settled_bars_are_bounded():
@@ -213,20 +303,17 @@ def test_remedy_merges_websocket_rows_with_rest_rows(jobs):
     assert jobs.duck_time[MARKET] == RT
 
 
-def test_remedy_with_rest_failures_writes_what_it_has_and_arms_full_remedy(jobs):
+def test_remedy_with_rest_failures_does_not_write(jobs):
     asyncio.run(jobs._remedy_incomplete_batch(MARKET, RT, partial_batch("A"), {"C", "D", "E"}))
-    (df, _, _), = jobs._client.written
-    assert sorted(df["symbol"]) == ["A", "C"]
-    # one bar behind again → the next bar's data_callback runs the full REST remedy
+    assert jobs._client.written == []
     assert jobs.duck_time[MARKET] == RT - INTERVAL
 
 
-def test_remedy_fetch_deadline_writes_what_arrived(jobs, monkeypatch):
+def test_remedy_fetch_deadline_does_not_write(jobs, monkeypatch):
     monkeypatch.setattr(data_jobs, "BATCH_REMEDY_FETCH_SEC", 0.05)
     asyncio.run(jobs._remedy_incomplete_batch(MARKET, RT, partial_batch("A"), {"C", "H"}))
-    (df, _, _), = jobs._client.written
-    assert sorted(df["symbol"]) == ["A", "C"]            # H was still in flight at the deadline
-    assert jobs.duck_time[MARKET] == RT - INTERVAL        # and is left to the full remedy
+    assert jobs._client.written == []
+    assert jobs.duck_time[MARKET] == RT - INTERVAL
 
 
 def test_remedy_with_nothing_to_write_leaves_state_alone(jobs):
@@ -235,7 +322,7 @@ def test_remedy_with_nothing_to_write_leaves_state_alone(jobs):
     assert jobs.duck_time[MARKET] == RT - INTERVAL
 
 
-def test_remedy_falls_back_to_full_remedy_when_more_than_one_bar_behind(jobs, monkeypatch):
+def test_single_bar_remedy_refuses_a_gap(jobs, monkeypatch):
     calls = []
 
     async def full(market, current_time, interval):
@@ -244,8 +331,16 @@ def test_remedy_falls_back_to_full_remedy_when_more_than_one_bar_behind(jobs, mo
     monkeypatch.setattr(jobs, "_fetch_and_insert_binance_data_async", full)
     jobs.duck_time[MARKET] = RT - 2 * INTERVAL
     asyncio.run(jobs._remedy_incomplete_batch(MARKET, RT, partial_batch("A"), {"C"}))
-    assert calls == [(MARKET, RT, data_jobs.KLINE_INTERVAL)]
+    assert calls == []
     assert jobs._client.written == [] and FakeFetcher.requested == []
+    assert jobs.duck_time[MARKET] == RT - 2 * INTERVAL
+
+
+def test_bar_has_gap_compares_close_times(jobs):
+    jobs.duck_time[MARKET] = RT - INTERVAL
+    assert jobs._bar_has_gap(RT, MARKET) is False
+    jobs.duck_time[MARKET] = RT - 2 * INTERVAL
+    assert jobs._bar_has_gap(RT, MARKET) is True
 
 
 # ── OptimizedKlineFetcher.get_all_klines ───────────────────────────────────────

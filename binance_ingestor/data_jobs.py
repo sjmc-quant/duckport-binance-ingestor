@@ -23,6 +23,7 @@ from binance_ingestor.utils.log_kit import logger, divider
 from binance_ingestor.config import (
     KLINE_INTERVAL_MINUTES, KLINE_INTERVAL,
     START_DATE, GENESIS_TIME, DATA_SOURCES, FETCH_CONCURRENCY, BATCH_REMEDY_FETCH_SEC,
+    ENABLE_BATCH_REMEDY,
 )
 from binance_ingestor.component.candle_fetcher import BinanceFetcher, OptimizedKlineFetcher
 from binance_ingestor.component.candle_listener import MarketListener
@@ -250,15 +251,27 @@ class WebsocketsDataJobs(DataJobs):
                         self.write_kline(market_df, market, run_time)
                         logger.debug(f"已写入 {_market} 市场数据{len(market_df)}条: at {now_time()}")
 
-                async def remedy_callback(run_time: datetime, partial: dict, missing: set, _market: str):
-                    await self._remedy_incomplete_batch(_market, run_time, partial, missing)
-
-                listener = MarketListener(
+                listener_kwargs = dict(
                     market=market,
                     data_callback=data_callback,
                     exginfo_callback=self.save_exginfo,
-                    remedy_callback=remedy_callback,
                 )
+                if ENABLE_BATCH_REMEDY:
+                    async def full_remedy_callback(run_time: datetime, _market: str):
+                        logger.warning(f'do remedy. [{_market}] runtime: {run_time}, ducktime: {self.duck_time[_market]}')
+                        await self._fetch_and_insert_binance_data_async(
+                            market=_market, current_time=run_time, interval=KLINE_INTERVAL)
+
+                    async def remedy_callback(run_time: datetime, partial: dict, missing: set, _market: str):
+                        await self._remedy_incomplete_batch(_market, run_time, partial, missing)
+
+                    listener_kwargs.update(
+                        remedy_callback=remedy_callback,
+                        full_remedy_callback=full_remedy_callback,
+                        gap_callback=self._bar_has_gap,
+                    )
+
+                listener = MarketListener(**listener_kwargs)
 
                 await listener.build_and_run()
 
@@ -267,21 +280,40 @@ class WebsocketsDataJobs(DataJobs):
                 gc.collect()
                 await asyncio.sleep(20)
 
+    def _bar_has_gap(self, run_time, market) -> bool:
+        """True when committing ``run_time`` would skip at least one bar past ``duck_time``.
+
+        ``duck_time`` stores the close time of the last written bar. The comparison does
+        not look at how many websocket symbols have arrived.
+        """
+        run_time = pd.Timestamp(run_time)
+        return run_time - self.duck_time[market] > timedelta(minutes=KLINE_INTERVAL_MINUTES)
+
     async def _remedy_incomplete_batch(self, market, run_time, partial: dict, missing: set):
-        """Write ``run_time``'s bar from the candles the websocket did deliver plus a REST
-        fetch of the missing symbols. Falls back to the full REST remedy when the market is
-        more than one bar behind (that path also covers the symbols in ``missing``)."""
+        """Fill one adjacent bar from the websocket rows already in hand plus REST for
+        ``missing``. Write once, and only when every symbol has the closed candle.
+        A gap larger than one bar is not handled here; ``on_bar_close`` sends that case
+        to the full remedy before this method is called."""
         interval = timedelta(minutes=KLINE_INTERVAL_MINUTES)
         run_time = pd.Timestamp(run_time)
-        if run_time - self.duck_time[market] > interval:
-            logger.warning(f'do remedy. [{market}] runtime: {run_time}, ducktime: {self.duck_time[market]}')
-            await self._fetch_and_insert_binance_data_async(market=market, current_time=run_time,
-                                                            interval=KLINE_INTERVAL)
+        bar_open = run_time - interval
+        if self._bar_has_gap(run_time, market):
+            logger.error(f"[Websocket] {market} bar {run_time}: refuse single-bar write across a gap "
+                         f"(duck_time={self.duck_time[market]})")
             return
-        frames = [df for df in (self._convert_market_data(k, market) for k in partial.values()) if df is not None]
-        failed = []
+        required = set(partial) | set(missing)
+        frames = []
+        got = set()
+        for symbol, kline_data in partial.items():
+            converted = self._convert_market_data(kline_data, market)
+            if converted is None or converted.empty:
+                continue
+            closed = converted[converted['open_time'] == bar_open]
+            if closed.empty:
+                continue
+            frames.append(closed)
+            got.add(symbol)
         if missing:
-            bar_open = run_time - interval
             async with create_aiohttp_session(10) as session:
                 fetcher = OptimizedKlineFetcher(BinanceFetcher(market, session), max_concurrent=FETCH_CONCURRENCY)
                 tasks = [asyncio.ensure_future(fetcher.get_klines_with_retry(symbol=s, interval=KLINE_INTERVAL, limit=2))
@@ -297,26 +329,22 @@ class WebsocketsDataJobs(DataJobs):
                     if pending:
                         await asyncio.gather(*pending, return_exceptions=True)
                 results = [t.result() for t in tasks if not t.cancelled() and t.exception() is None]
-            failed = sorted(set(missing) - {r['symbol'] for r in results})   # still in flight at the deadline
             for r in results:
+                # limit=2 includes the candle that is still forming; keep only this close
                 df = r['data'][r['data']['open_time'] == bar_open] if r.get('success') else None
                 if df is None or df.empty:
-                    failed.append(r['symbol'])      # REST failed, or the bar is not on REST yet
-                else:
-                    frames.append(df)
-        if not frames:
-            logger.error(f"[Websocket] {market} bar {run_time}: nothing to write ({len(failed)} symbols failed)")
+                    continue
+                frames.append(df)
+                got.add(r['symbol'])
+        if got != required or not frames:
+            missing_symbols = sorted(required - got)
+            logger.error(f"[Websocket] {market} bar {run_time}: closed bar incomplete "
+                         f"({len(got)}/{len(required)}), not writing: {missing_symbols[:10]}")
             return
-        df = pd.concat(frames)
+        df = pd.concat(frames, ignore_index=True)
         self.write_kline(df, market, run_time)
         logger.info(f"[Websocket] {market} bar {run_time} completed: {len(df)} rows "
                     f"({len(partial)} from websocket, {len(df) - len(partial)} over REST)")
-        if failed:
-            # leave the in-memory duck_time one bar back so the next bar triggers the full
-            # REST remedy, which fills these symbols (the merge skips rows already present)
-            logger.error(f"[Websocket] {market} bar {run_time}: {len(failed)} symbols still missing after REST, "
-                         f"full remedy on next bar: {failed[:10]}")
-            self.duck_time[market] = run_time - interval
 
     def _run_websocket_data_collection(self):
         async def run_async():

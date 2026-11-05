@@ -9,8 +9,7 @@ from binance_ingestor.api import (get_coin_futures_multi_candlesticks_socket, ge
 from binance_ingestor.bus import TRADE_TYPE_MAP
 from binance_ingestor.component.candle_fetcher import BinanceFetcher
 from binance_ingestor.utils import convert_interval_to_timedelta, get_logger, create_aiohttp_session
-from binance_ingestor.config import (KLINE_INTERVAL, FETCH_CONCURRENCY, BATCH_REMEDY_WAIT_SEC,
-                                     BATCH_REMEDY_TIMEOUT_SEC)
+from binance_ingestor.config import KLINE_INTERVAL, FETCH_CONCURRENCY, BATCH_REMEDY_WAIT_SEC
 from binance_ingestor.utils.log_kit import logger, divider
 from binance_ingestor.utils.time import now_time, async_sleep_until_run_time, next_run_time
 
@@ -50,6 +49,7 @@ class CandleListener:
         self.interval_delta = convert_interval_to_timedelta(time_interval)
         self.que: asyncio.Queue = que
         self.req_reconnect = False
+        self._socket = None
 
     async def start_listen(self):
         if not self.symbols:
@@ -58,17 +58,25 @@ class CandleListener:
         socket_func = self.TRADE_TYPE_MAP[self.trade_type]
         while True:
             socket = socket_func(self.symbols, self.time_interval)
-            async with socket as socket_conn:
-                while True:
-                    if self.req_reconnect:
-                        self.req_reconnect = False
-                        break
-                    try:
-                        res = await socket_conn.recv()
+            self._socket = socket
+            try:
+                async with socket as socket_conn:
+                    self._socket = socket_conn
+                    while True:
+                        if self.req_reconnect:
+                            self.req_reconnect = False
+                            break
+                        try:
+                            res = await socket_conn.recv()
+                        except asyncio.TimeoutError:
+                            get_logger().error('Recv candle ws timeout, reconnecting')
+                            break
+                        if isinstance(res, dict) and res.get('e') == 'forced_reconnect':
+                            self.req_reconnect = False
+                            break
                         self.handle_candle_data(res)
-                    except asyncio.TimeoutError:
-                        get_logger().error('Recv candle ws timeout, reconnecting')
-                        break
+            finally:
+                self._socket = None
 
     def handle_candle_data(self, res):
         if 'data' not in res:
@@ -106,6 +114,13 @@ class CandleListener:
     def reconnect(self):
         self.req_reconnect = True
 
+    async def force_reconnect(self):
+        """Cut the current socket so ``start_listen`` dials a new one immediately."""
+        self.req_reconnect = True
+        socket = self._socket
+        if socket is not None and hasattr(socket, 'force_disconnect'):
+            await socket.force_disconnect()
+
 
 class MarketListener:
 
@@ -114,7 +129,8 @@ class MarketListener:
     SETTLED_KEEP = 12
 
     def __init__(self, market='usdt_perp', data_callback=None, exginfo_callback=None,
-                 remedy_callback=None, remedy_wait_sec=BATCH_REMEDY_WAIT_SEC):
+                 remedy_callback=None, full_remedy_callback=None, gap_callback=None,
+                 remedy_wait_sec=BATCH_REMEDY_WAIT_SEC):
         self.main_queue = asyncio.Queue()
         self.market = market
         self.listeners = {}
@@ -125,6 +141,8 @@ class MarketListener:
         self.data_callback = data_callback
         self.exginfo_callback = exginfo_callback
         self.remedy_callback = remedy_callback
+        self.full_remedy_callback = full_remedy_callback
+        self.gap_callback = gap_callback
         self.remedy_wait_sec = remedy_wait_sec
 
     async def build_and_run(self):
@@ -239,19 +257,58 @@ class MarketListener:
             self._cleanup_batch_data(run_time)
 
     async def batch_watchdog(self):
-        """Complete a bar over REST when its websocket batch is still incomplete
-        ``remedy_wait_sec`` after the close (a listener group that dropped at the close
-        never delivers its closed candles; waiting for the next bar's remedy would make
-        the bar a whole interval late)."""
+        """At each close, compare ``run_time`` with the watermark, then either run the
+        full remedy immediately or wait ``remedy_wait_sec`` for this bar's batch."""
         wait = timedelta(seconds=self.remedy_wait_sec)
         while True:
             run_time = pd.Timestamp(next_run_time(KLINE_INTERVAL))
-            await async_sleep_until_run_time(run_time + wait)
-            await self.remedy_incomplete(run_time)
+            await async_sleep_until_run_time(run_time)
+            if await self.on_bar_close(run_time) == 'wait':
+                await async_sleep_until_run_time(run_time + wait)
+                await self.remedy_incomplete(run_time)
+
+    async def on_bar_close(self, run_time) -> str:
+        """Decide this close before waiting for the batch.
+
+        Returns ``full`` when the watermark is more than one bar behind and the full
+        remedy was started, ``wait`` when this bar is adjacent and the caller should
+        wait for the websocket batch, or ``settled`` when there is nothing to do.
+        """
+        run_time = pd.Timestamp(run_time)
+        if run_time in self._settled or not self.remedy_callback:
+            return 'settled'
+        if self.gap_callback and self.gap_callback(run_time, self.market):
+            self._mark_settled(run_time, 'full')
+            self._cleanup_batch_data(run_time)
+            logger.warning(f"[Websocket] {self.market} bar {run_time:%Y-%m-%d %H:%M} is more than one "
+                           f"interval behind the watermark; running the full REST remedy")
+            try:
+                if self.full_remedy_callback:
+                    await self.full_remedy_callback(run_time, self.market)
+            except Exception as e:
+                logger.error(f"[Websocket] {self.market} bar {run_time:%Y-%m-%d %H:%M} full remedy failed: {e}")
+            return 'full'
+        return 'wait'
+
+    async def _reconnect_missing(self, missing) -> list:
+        """Cut and redial only the listener groups that own ``missing`` symbols."""
+        group_ids = []
+        for symbol in sorted(missing):
+            group_id = hash(symbol) % FETCH_CONCURRENCY
+            if group_id in group_ids or group_id not in self.listeners:
+                continue
+            group_ids.append(group_id)
+            listener = self.listeners[group_id]
+            force_reconnect = getattr(listener, 'force_reconnect', None)
+            if force_reconnect is not None:
+                await force_reconnect()
+            else:
+                listener.reconnect()
+        return group_ids
 
     async def remedy_incomplete(self, run_time) -> bool:
-        """Hand ``run_time``'s partial batch and its missing symbols to ``remedy_callback``
-        unless the bar is already settled. Returns True when a remedy was attempted."""
+        """Reconnect the groups still missing candles and hand the partial batch to
+        ``remedy_callback``. Returns True when a remedy was attempted."""
         run_time = pd.Timestamp(run_time)
         if run_time in self._settled or not self.remedy_callback:
             return False
@@ -263,13 +320,10 @@ class MarketListener:
         self._cleanup_batch_data(run_time)
         logger.warning(f"[Websocket] {self.market} batch {run_time:%Y-%m-%d %H:%M} incomplete "
                        f"{self.remedy_wait_sec:g}s after close: {len(collected)}/{len(self.symbols)} collected, "
-                       f"completing {len(missing)} symbols over REST: {sorted(missing)[:5]}...")
+                       f"reconnecting groups and completing {len(missing)} symbols over REST: {sorted(missing)[:5]}...")
         try:
-            await asyncio.wait_for(self.remedy_callback(run_time, partial, missing, self.market),
-                                   timeout=BATCH_REMEDY_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            logger.error(f"[Websocket] {self.market} batch {run_time:%Y-%m-%d %H:%M} remedy timed out "
-                         f"after {BATCH_REMEDY_TIMEOUT_SEC:g}s")
+            await self._reconnect_missing(missing)
+            await self.remedy_callback(run_time, partial, missing, self.market)
         except Exception as e:
             logger.error(f"[Websocket] {self.market} batch {run_time:%Y-%m-%d %H:%M} remedy failed: {e}")
         return True
