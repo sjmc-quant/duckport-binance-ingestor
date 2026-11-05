@@ -5,13 +5,15 @@ Run with ``PYTHONPATH=. pytest tests``.
 """
 import asyncio
 import contextlib
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pandas as pd
 import pytest
+import pytz
 
 from binance_ingestor import data_jobs
 from binance_ingestor.component import candle_listener
+from binance_ingestor.component.candle_fetcher import OptimizedKlineFetcher
 from binance_ingestor.component.candle_listener import MarketListener
 from binance_ingestor.data_jobs import WebsocketsDataJobs
 
@@ -63,9 +65,11 @@ def test_incomplete_batch_is_remedied_and_late_candles_dropped():
     async def run():
         await listener._handle_candle(ws_req("A"))
         await listener._handle_candle(ws_req("B"))
-        # the watchdog computes run_time from the clock (datetime), the batches are keyed by
-        # the candle's Timestamp: both must address the same batch
-        assert await listener.remedy_incomplete(RT.to_pydatetime()) is True
+        # the watchdog computes run_time from the clock (a pytz-UTC datetime, as
+        # next_run_time builds it), the batches are keyed by the candle's Timestamp:
+        # both must address the same batch
+        clock_rt = pytz.UTC.localize(datetime(2026, 11, 5, 1, 40))
+        assert await listener.remedy_incomplete(clock_rt) is True
         assert remedies == [(RT, {"A", "B"}, {"C"}, MARKET)]
         assert writes == []
         assert RT not in listener._data_batches and RT not in listener._batch_status
@@ -159,7 +163,8 @@ class FakeClient:
 
 
 class FakeFetcher:
-    """Stands in for OptimizedKlineFetcher: C has the closed bar, D fails, E is not on REST yet."""
+    """Stands in for OptimizedKlineFetcher: C has the closed bar, D fails, E is not on REST
+    yet, H hangs (a symbol stuck in retry back-off)."""
     requested = []
 
     def __init__(self, fetcher, max_concurrent):
@@ -169,6 +174,8 @@ class FakeFetcher:
         FakeFetcher.requested.append((symbol, interval, limit))
         if symbol == "D":
             return {"symbol": symbol, "success": False, "error": "boom"}
+        if symbol == "H":
+            await asyncio.sleep(10)
         if symbol == "E":
             return {"symbol": symbol, "success": True, "data": rest_df(symbol, [RT - 3 * INTERVAL, RT - 2 * INTERVAL])}
         return {"symbol": symbol, "success": True, "data": rest_df(symbol, [RT - INTERVAL, RT])}
@@ -214,6 +221,14 @@ def test_remedy_with_rest_failures_writes_what_it_has_and_arms_full_remedy(jobs)
     assert jobs.duck_time[MARKET] == RT - INTERVAL
 
 
+def test_remedy_fetch_deadline_writes_what_arrived(jobs, monkeypatch):
+    monkeypatch.setattr(data_jobs, "BATCH_REMEDY_FETCH_SEC", 0.05)
+    asyncio.run(jobs._remedy_incomplete_batch(MARKET, RT, partial_batch("A"), {"C", "H"}))
+    (df, _, _), = jobs._client.written
+    assert sorted(df["symbol"]) == ["A", "C"]            # H was still in flight at the deadline
+    assert jobs.duck_time[MARKET] == RT - INTERVAL        # and is left to the full remedy
+
+
 def test_remedy_with_nothing_to_write_leaves_state_alone(jobs):
     asyncio.run(jobs._remedy_incomplete_batch(MARKET, RT, {}, {"D"}))
     assert jobs._client.written == []
@@ -231,3 +246,42 @@ def test_remedy_falls_back_to_full_remedy_when_more_than_one_bar_behind(jobs, mo
     asyncio.run(jobs._remedy_incomplete_batch(MARKET, RT, partial_batch("A"), {"C"}))
     assert calls == [(MARKET, RT, data_jobs.KLINE_INTERVAL)]
     assert jobs._client.written == [] and FakeFetcher.requested == []
+
+
+# ── OptimizedKlineFetcher.get_all_klines ───────────────────────────────────────
+
+class FakeBinanceFetcher:
+    trade_type = MARKET
+
+    def get_api_limits(self):
+        return 2400, 5
+
+
+def make_all_klines_fetcher(fail_rounds_by_symbol):
+    """A fetcher whose symbol fails for the first N rounds given in ``fail_rounds_by_symbol``."""
+    fetcher = OptimizedKlineFetcher(FakeBinanceFetcher(), max_concurrent=4)
+    calls = {}
+
+    async def fake(symbol, interval, limit, end_timestamp=None):
+        calls[symbol] = calls.get(symbol, 0) + 1
+        if calls[symbol] <= fail_rounds_by_symbol.get(symbol, 0):
+            return {"symbol": symbol, "success": False, "error": "boom"}
+        return {"symbol": symbol, "success": True, "data": rest_df(symbol, [RT - INTERVAL]),
+                "num": 1, "begin_time": RT - INTERVAL}
+
+    fetcher.get_klines_with_retry = fake
+    return fetcher, calls
+
+
+def test_get_all_klines_retries_only_failed_symbols_and_gives_up():
+    fetcher, calls = make_all_klines_fetcher({"B": 1, "D": 99})
+    results = asyncio.run(fetcher.get_all_klines(["A", "B", "C", "D"], interval="5m", limit=2))
+    ok = sorted(r["symbol"] for r in results if r["success"])
+    assert ok == ["A", "B", "C"]
+    assert calls == {"A": 1, "C": 1, "B": 2, "D": OptimizedKlineFetcher.MAX_FAILED_ROUNDS}
+
+
+def test_get_all_klines_all_good_is_one_round():
+    fetcher, calls = make_all_klines_fetcher({})
+    results = asyncio.run(fetcher.get_all_klines(["A", "B"], interval="5m", limit=2))
+    assert all(r["success"] for r in results) and calls == {"A": 1, "B": 1}

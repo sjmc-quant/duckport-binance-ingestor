@@ -22,7 +22,7 @@ from binance_ingestor.utils import next_run_time, async_sleep_until_run_time, no
 from binance_ingestor.utils.log_kit import logger, divider
 from binance_ingestor.config import (
     KLINE_INTERVAL_MINUTES, KLINE_INTERVAL,
-    START_DATE, GENESIS_TIME, DATA_SOURCES, FETCH_CONCURRENCY,
+    START_DATE, GENESIS_TIME, DATA_SOURCES, FETCH_CONCURRENCY, BATCH_REMEDY_FETCH_SEC,
 )
 from binance_ingestor.component.candle_fetcher import BinanceFetcher, OptimizedKlineFetcher
 from binance_ingestor.component.candle_listener import MarketListener
@@ -284,10 +284,20 @@ class WebsocketsDataJobs(DataJobs):
             bar_open = run_time - interval
             async with create_aiohttp_session(10) as session:
                 fetcher = OptimizedKlineFetcher(BinanceFetcher(market, session), max_concurrent=FETCH_CONCURRENCY)
-                results = await asyncio.gather(*[
-                    fetcher.get_klines_with_retry(symbol=s, interval=KLINE_INTERVAL, limit=2)
-                    for s in sorted(missing)
-                ])
+                tasks = [asyncio.ensure_future(fetcher.get_klines_with_retry(symbol=s, interval=KLINE_INTERVAL, limit=2))
+                         for s in sorted(missing)]
+                # a symbol that keeps failing backs off for ~96s; do not let it hold the bar
+                try:
+                    await asyncio.wait(tasks, timeout=BATCH_REMEDY_FETCH_SEC)
+                finally:
+                    # also on cancellation (shutdown): no fetch task may outlive the session
+                    pending = [t for t in tasks if not t.done()]
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                results = [t.result() for t in tasks if not t.cancelled() and t.exception() is None]
+            failed = sorted(set(missing) - {r['symbol'] for r in results})   # still in flight at the deadline
             for r in results:
                 df = r['data'][r['data']['open_time'] == bar_open] if r.get('success') else None
                 if df is None or df.empty:

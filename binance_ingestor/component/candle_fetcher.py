@@ -186,6 +186,10 @@ class WeightManager:
 
 class OptimizedKlineFetcher:
 
+    # rounds a symbol may fail (get_klines_with_retry retries 3x inside each) before
+    # get_all_klines gives up on it and returns without it
+    MAX_FAILED_ROUNDS = 3
+
     def __init__(self, fetcher: BinanceFetcher, max_concurrent: int = 10):
         self.fetcher = fetcher
         self.max_concurrent = max_concurrent
@@ -245,9 +249,10 @@ class OptimizedKlineFetcher:
         logger.info(f"start fetching {len(symbols)} symbols...")
 
         interval_delta = pd.Timedelta(interval)
-        fetch_symbols = symbols.copy()
+        fetch_symbols = list(symbols)
         results = []
         last_begin_time = dict()
+        fail_rounds: Dict[str, int] = {}
         num = 0
         while fetch_symbols:
             num += 1
@@ -272,7 +277,10 @@ class OptimizedKlineFetcher:
 
             results.extend(current_batch_result)
             logger.ok(f'[Restful] {self.fetcher.trade_type} - process done. total: {len(fetch_symbols)}')
-            failed = [r for r in results if not r.get('success', False)]
+            # judge this round only: a symbol that failed earlier but succeeded now is done, and
+            # the symbols that succeeded must not be fetched again while others are retried
+            failed = [r for r in current_batch_result if not r.get('success', False)]
+            succeed = [r for r in current_batch_result if r.get('success', False)]
 
             if failed:
                 logger.warning("\nFailed Symbols:")
@@ -280,17 +288,22 @@ class OptimizedKlineFetcher:
                     logger.warning(f"  {f['symbol']}: {f.get('error', 'Unknown error')}")
                 if len(failed) > 10:
                     logger.critical(f"  ... and {len(failed) - 10} more failures")
+                for f in failed:
+                    fail_rounds[f['symbol']] = fail_rounds.get(f['symbol'], 0) + 1
+                    if fail_rounds[f['symbol']] >= self.MAX_FAILED_ROUNDS:
+                        logger.critical(f"  {f['symbol']}: giving up after {self.MAX_FAILED_ROUNDS} rounds")
+                        fetch_symbols.remove(f['symbol'])
+
+            if start_time:
+                for s in succeed:
+                    con1 = s.get('begin_time') > start_time
+                    con2 = s.get('num') == limit
+                    if con1 and con2:
+                        last_begin_time[s.get('symbol')] = s.get('begin_time')
+                    elif s.get('symbol') in fetch_symbols:
+                        fetch_symbols.remove(s.get('symbol'))
             else:
-                succeed = [r for r in results if r.get('success', False)]
-                if start_time:
-                    for s in succeed:
-                        con1 = s.get('begin_time') > start_time
-                        con2 = s.get('num') == limit
-                        if con1 and con2:
-                            last_begin_time[s.get('symbol')] = s.get('begin_time')
-                        elif s.get('symbol') in fetch_symbols:
-                            fetch_symbols.remove(s.get('symbol'))
-                else:
-                    [fetch_symbols.remove(s.get('symbol')) for s in succeed]
+                for s in succeed:
+                    fetch_symbols.remove(s.get('symbol'))
 
         return results

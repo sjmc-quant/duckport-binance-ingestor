@@ -56,7 +56,14 @@ FETCH_CONCURRENCY = min(CONCURRENCY, 10)
 # only be written by the next bar's remedy, a whole interval late. After this
 # many seconds an incomplete batch is completed over REST instead.
 BATCH_REMEDY_WAIT_SEC = float(os.getenv("BATCH_REMEDY_WAIT_SEC", 8))
-# Upper bound for one such remedy (REST fetch + write) before giving up on it.
+if not 0 < BATCH_REMEDY_WAIT_SEC < KLINE_INTERVAL_MINUTES * 60:
+    raise ValueError(f"BATCH_REMEDY_WAIT_SEC must be between 0 and the bar length "
+                     f"({KLINE_INTERVAL_MINUTES * 60}s), got {BATCH_REMEDY_WAIT_SEC}")
+# How long the REST fetch of the missing symbols may take; symbols still in flight
+# after this are written by the next bar's full remedy (~1s normally, a symbol that
+# keeps failing backs off for ~96s and would otherwise hold the whole bar).
+BATCH_REMEDY_FETCH_SEC = float(os.getenv("BATCH_REMEDY_FETCH_SEC", 30))
+# Upper bound for one whole remedy (REST fetch + write) before giving up on it.
 BATCH_REMEDY_TIMEOUT_SEC = float(os.getenv("BATCH_REMEDY_TIMEOUT_SEC", 120))
 
 # ── Data sources ──────────────────────────────────────────────────────
