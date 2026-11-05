@@ -188,6 +188,30 @@ class ReconnectingWebsocket:
     async def recv(self):
         return await asyncio.wait_for(self._queue.get(), timeout=self.TIMEOUT)
 
+    async def force_disconnect(self):
+        """Close the socket and unblock ``recv`` so the listener can dial a new one.
+
+        ``reconnect()`` on the listener is only noticed between receives. A dead
+        connection can sit in ``recv`` for ``TIMEOUT`` seconds, so the timeout path
+        closes the socket and pushes a sentinel onto the queue.
+        """
+        self.ws_state = WSListenerState.EXITING
+        if self.ws is not None:
+            try:
+                await self.ws.close(code=1011)
+            except Exception:
+                pass
+        sentinel = {'e': 'forced_reconnect'}
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self._queue.put_nowait(sentinel)
+        except asyncio.QueueFull:
+            pass
+
     async def _wait_for_reconnect(self):
         while self.ws_state != WSListenerState.STREAMING and self.ws_state != WSListenerState.EXITING:
             await asyncio.sleep(0.1)

@@ -50,6 +50,20 @@ RESOURCE_PATH = os.getenv("RESOURCE_PATH", str(_DUCKPORT_DATA / "hist"))
 CONCURRENCY = int(os.getenv('CONCURRENCY', 2))
 FETCH_CONCURRENCY = min(CONCURRENCY, 10)
 
+# ── WebSocket batch remedy ────────────────────────────────────────────
+# Off by default. When enabled, a close whose duck_time is more than one bar
+# behind goes straight to the full REST remedy. An adjacent bar waits this many
+# seconds; if the websocket batch is still incomplete, the missing symbols are
+# filled over REST and written only when every symbol for that close is present.
+ENABLE_BATCH_REMEDY = os.getenv("ENABLE_BATCH_REMEDY", "false").lower() == "true"
+BATCH_REMEDY_WAIT_SEC = float(os.getenv("BATCH_REMEDY_WAIT_SEC", "8"))
+if not 0 < BATCH_REMEDY_WAIT_SEC < KLINE_INTERVAL_MINUTES * 60:
+    raise ValueError(f"BATCH_REMEDY_WAIT_SEC must be between 0 and the bar length "
+                     f"({KLINE_INTERVAL_MINUTES * 60}s), got {BATCH_REMEDY_WAIT_SEC}")
+# Internal deadline for the missing-symbol REST fetch. A symbol stuck in retry
+# back-off must not hold the bar. Not a plugin setting.
+BATCH_REMEDY_FETCH_SEC = 30
+
 # ── Data sources ──────────────────────────────────────────────────────
 DATA_SOURCES_STR = os.getenv('DATA_SOURCES', 'usdt_perp,usdt_spot')
 DATA_SOURCES = set(s.strip() for s in DATA_SOURCES_STR.split(','))
