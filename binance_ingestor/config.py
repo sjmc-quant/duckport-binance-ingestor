@@ -50,6 +50,15 @@ RESOURCE_PATH = os.getenv("RESOURCE_PATH", str(_DUCKPORT_DATA / "hist"))
 CONCURRENCY = int(os.getenv('CONCURRENCY', 2))
 FETCH_CONCURRENCY = min(CONCURRENCY, 10)
 
+# ── WebSocket batch remedy ────────────────────────────────────────────
+# A bar's closed candles normally all arrive within ~3s of the close. When a
+# listener group drops right then, its symbols never arrive and the bar would
+# only be written by the next bar's remedy, a whole interval late. After this
+# many seconds an incomplete batch is completed over REST instead.
+BATCH_REMEDY_WAIT_SEC = float(os.getenv("BATCH_REMEDY_WAIT_SEC", 8))
+# Upper bound for one such remedy (REST fetch + write) before giving up on it.
+BATCH_REMEDY_TIMEOUT_SEC = float(os.getenv("BATCH_REMEDY_TIMEOUT_SEC", 120))
+
 # ── Data sources ──────────────────────────────────────────────────────
 DATA_SOURCES_STR = os.getenv('DATA_SOURCES', 'usdt_perp,usdt_spot')
 DATA_SOURCES = set(s.strip() for s in DATA_SOURCES_STR.split(','))
