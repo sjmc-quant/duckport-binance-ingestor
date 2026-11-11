@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 import pandas as pd
 from dotenv import load_dotenv
 
+from binance_ingestor.markets import parse_data_sources
+
 # Load instance env (INGESTOR_ENV_FILE set by ingestor-run) then local config.env
 _env_file = os.getenv("INGESTOR_ENV_FILE", "config.env")
 load_dotenv(_env_file, override=False)
@@ -66,7 +68,9 @@ BATCH_REMEDY_FETCH_SEC = 30
 
 # ── Data sources ──────────────────────────────────────────────────────
 DATA_SOURCES_STR = os.getenv('DATA_SOURCES', 'usdt_perp,usdt_spot')
-DATA_SOURCES = set(s.strip() for s in DATA_SOURCES_STR.split(','))
+# Unknown names and a mix of USDT / non-USDT markets are rejected here, before either
+# entry point (main, loadhist) connects to duckport.
+DATA_SOURCES = set(parse_data_sources(DATA_SOURCES_STR))
 
 # ── Start date ────────────────────────────────────────────────────────
 GENESIS_TIME = pd.to_datetime('2009-01-03 00:00:00').tz_localize(tz=timezone.utc)

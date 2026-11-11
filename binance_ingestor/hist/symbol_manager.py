@@ -8,6 +8,7 @@ from lxml import objectify
 
 from binance_ingestor.utils.log_kit import logger
 from binance_ingestor.config import root_center_url, proxy, blind
+from binance_ingestor.markets import select_archive_symbols
 
 
 async def request_session(session, params):
@@ -76,6 +77,11 @@ def async_get_usdt_symbols(params):
     usdt = set()
     [usdt.add(i) for i in all_symbols if i.endswith('USDT')]
     return usdt
+
+
+def async_get_market_symbols(market, params):
+    """Symbols of ``market`` among the archive prefixes listed by ``params``."""
+    return select_archive_symbols(market, async_get_all_symbols(params))
 
 
 def spot_symbols_filter(symbols):

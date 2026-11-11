@@ -8,6 +8,7 @@ from binance_ingestor.api import (get_coin_futures_multi_candlesticks_socket, ge
                                    get_usdt_futures_multi_candlesticks_socket)
 from binance_ingestor.bus import TRADE_TYPE_MAP
 from binance_ingestor.component.candle_fetcher import BinanceFetcher
+from binance_ingestor.markets import VENUE_CM, VENUE_SPOT, VENUE_UM, venue_of
 from binance_ingestor.utils import convert_interval_to_timedelta, get_logger, create_aiohttp_session
 from binance_ingestor.config import KLINE_INTERVAL, FETCH_CONCURRENCY, BATCH_REMEDY_WAIT_SEC
 from binance_ingestor.utils.log_kit import logger, divider
@@ -36,10 +37,10 @@ def convert_to_dataframe(x, interval_delta):
 
 class CandleListener:
 
-    TRADE_TYPE_MAP = {
-        'usdt_perp': get_usdt_futures_multi_candlesticks_socket,
-        'coin_perp': get_coin_futures_multi_candlesticks_socket,
-        'usdt_spot': get_spot_multi_candlesticks_socket
+    VENUE_SOCKETS = {
+        VENUE_UM: get_usdt_futures_multi_candlesticks_socket,
+        VENUE_CM: get_coin_futures_multi_candlesticks_socket,
+        VENUE_SPOT: get_spot_multi_candlesticks_socket,
     }
 
     def __init__(self, type_, symbols, time_interval, que):
@@ -55,7 +56,7 @@ class CandleListener:
         if not self.symbols:
             return
 
-        socket_func = self.TRADE_TYPE_MAP[self.trade_type]
+        socket_func = self.VENUE_SOCKETS[venue_of(self.trade_type)]
         while True:
             socket = socket_func(self.symbols, self.time_interval)
             self._socket = socket

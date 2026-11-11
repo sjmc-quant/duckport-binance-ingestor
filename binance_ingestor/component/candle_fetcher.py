@@ -8,6 +8,7 @@ import pandas as pd
 
 from binance_ingestor.api.binance_market_restful import create_binance_market_api
 from binance_ingestor.api.exceptions import BinanceAPIException
+from binance_ingestor.markets import VENUE_CM, VENUE_SPOT, VENUE_UM, venue_of
 from binance_ingestor.utils import async_retry_getter
 from binance_ingestor.utils.log_kit import logger, divider
 
@@ -24,14 +25,14 @@ def _get_from_filters(filters, filter_type, field_name):
             return f[field_name]
 
 
-def _parse_usdt_futures_syminfo(info):
+def _parse_usdt_futures_syminfo(info, market='usdt_perp'):
     filters = info['filters']
     price_tick = _get_from_filters(filters, 'PRICE_FILTER', 'tickSize') or '0.01'
     lot_size = _get_from_filters(filters, 'LOT_SIZE', 'stepSize') or '0.001'
     min_notional = _get_from_filters(filters, 'MIN_NOTIONAL', 'notional') or '5'
 
     return {
-        'market': 'usdt_perp',
+        'market': market,
         'symbol': info['symbol'],
         'contract_type': info['contractType'],
         'underlying_type': info.get('underlyingType'),
@@ -45,10 +46,10 @@ def _parse_usdt_futures_syminfo(info):
         'pre_market': None
     }
 
-def _parse_coin_futures_syminfo(info):
+def _parse_coin_futures_syminfo(info, market='coin_perp'):
     filters = info['filters']
     return {
-        'market': 'coin_perp',
+        'market': market,
         'symbol': info['symbol'],
         'contract_type': info['contractType'],
         'underlying_type': info.get('underlyingType'),
@@ -62,7 +63,7 @@ def _parse_coin_futures_syminfo(info):
     }
 
 
-def _parse_spot_syminfo(info):
+def _parse_spot_syminfo(info, market='usdt_spot'):
     filters = info['filters']
     permission_sets = info.get('permissionSets', [])
     price_tick = _get_from_filters(filters, 'PRICE_FILTER', 'tickSize') or '0.01'
@@ -70,7 +71,7 @@ def _parse_spot_syminfo(info):
     min_notional = _get_from_filters(filters, 'NOTIONAL', 'minNotional') or '10'
 
     return {
-        'market': 'usdt_spot',
+        'market': market,
         'symbol': info['symbol'],
         'status': info['status'],
         'base_asset': info['baseAsset'],
@@ -86,20 +87,19 @@ def _parse_spot_syminfo(info):
 
 class BinanceFetcher:
 
-    TYPE_MAP = {
-        'usdt_perp': _parse_usdt_futures_syminfo,
-        'coin_perp': _parse_coin_futures_syminfo,
-        'usdt_spot': _parse_spot_syminfo,
+    # exchangeInfo layout differs per venue; the row's ``market`` is the market being fetched
+    VENUE_PARSERS = {
+        VENUE_UM: _parse_usdt_futures_syminfo,
+        VENUE_CM: _parse_coin_futures_syminfo,
+        VENUE_SPOT: _parse_spot_syminfo,
     }
 
     def __init__(self, type_, session):
         self.trade_type = type_
         self.market_api = create_binance_market_api(type_, session)
 
-        if type_ in self.TYPE_MAP:
-            self.syminfo_parse_func = self.TYPE_MAP[type_]
-        else:
-            raise ValueError(f'Type {type_} not supported')
+        parser = self.VENUE_PARSERS[venue_of(type_)]
+        self.syminfo_parse_func = lambda info: parser(info, market=type_)
 
     def get_api_limits(self) -> tuple[int, int]:
         return self.market_api.MAX_MINUTE_WEIGHT, self.market_api.WEIGHT_EFFICIENT_ONCE_CANDLES

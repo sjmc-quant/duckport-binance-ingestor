@@ -165,6 +165,10 @@ class DuckportClient:
         )
 
     @staticmethod
+    def _exginfo_staging(market: str) -> str:
+        return f"_staging_exginfo_{market}"
+
+    @staticmethod
     def _sql_str(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
 
@@ -342,8 +346,16 @@ class DuckportClient:
             f"({exginfo_cols}, "
             f"created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
             f"ALTER TABLE {s}.exginfo ADD COLUMN IF NOT EXISTS underlying_type VARCHAR",
-            "DROP TABLE IF EXISTS _staging_exginfo",
-            f"CREATE TABLE _staging_exginfo ({exginfo_cols})",
+        ] + [
+            # One staging table per market: two instances refresh exginfo independently,
+            # and a shared table would let one instance's rows replace the other's market.
+            stmt
+            for market in markets if market in data_sources
+            for stmt in (
+                f"DROP TABLE IF EXISTS {self._exginfo_staging(market)}",
+                f"CREATE TABLE {self._exginfo_staging(market)} ({exginfo_cols})",
+            )
+        ] + [
             f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
             f"VALUES ('write_mode:exginfo', 'anti_join')",
         ]
@@ -533,15 +545,17 @@ class DuckportClient:
             sub, schema=self.EXGINFO_ARROW_SCHEMA, preserve_index=False,
         )
 
-        self.execute("TRUNCATE _staging_exginfo")
-        self.append("main", "_staging_exginfo", arrow_table)
+        staging = self._exginfo_staging(market)
+        self.execute(f"TRUNCATE {staging}")
+        self.append("main", staging, arrow_table)
 
         col_list = ", ".join(cols)
         self.execute_transaction([
             f"DELETE FROM {s}.exginfo WHERE market = '{market}'",
             f"INSERT INTO {s}.exginfo ({col_list}) "
-            f"SELECT DISTINCT ON (market, symbol) {col_list} FROM _staging_exginfo",
-            "TRUNCATE _staging_exginfo",
+            f"SELECT DISTINCT ON (market, symbol) {col_list} FROM {staging} "
+            f"WHERE market = '{market}'",
+            f"TRUNCATE {staging}",
         ])
         logger.info(f"save_exginfo: {market}, {len(df)} records")
 
