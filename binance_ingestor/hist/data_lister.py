@@ -13,14 +13,13 @@ from lxml import objectify
 
 from binance_ingestor.utils.log_kit import logger
 from binance_ingestor.config import metrics_prefix, START_DATE
+from binance_ingestor.markets import VENUE_SPOT, VENUE_UM, venue_of
 from .symbol_manager import request_session, request_session_4_list
 from .file_manager import get_local_path
 
 
 def get_download_prefix(trading_type, market_data_type, time_period, symbol, interval):
-    trading_type_path = 'data/spot'
-    if trading_type == 'usdt_perp':
-        trading_type_path = 'data/futures/um'
+    trading_type_path = {VENUE_SPOT: 'data/spot', VENUE_UM: 'data/futures/um'}[venue_of(trading_type)]
 
     if symbol is None:
         return f'{trading_type_path}/{time_period}/{market_data_type}/'

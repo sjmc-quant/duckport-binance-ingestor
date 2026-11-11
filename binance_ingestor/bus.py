@@ -1,4 +1,5 @@
-from .filter_symbol import TradingSpotFilter, TradingCoinFuturesFilter, TradingUsdtFuturesFilter
+from .filter_symbol import (TradingSpotFilter, TradingCoinFuturesFilter, TradingUsdtFuturesFilter,
+                            TradingOtherQuoteFuturesFilter)
 
 DELIVERY_TYPES = ['CURRENT_QUARTER', 'NEXT_QUARTER']
 
@@ -10,6 +11,9 @@ TRADE_TYPE_MAP = {
 
     # usdt_futures
     'usdt_perp': (TradingUsdtFuturesFilter(quote_asset='USDT', types=['PERPETUAL', 'TRADIFI_PERPETUAL']), 'um'),
+    # every USD-M perpetual that usdt_perp does not take (USDC, USD1, U, BTC, ... quotes)
+    'others_perp': (TradingOtherQuoteFuturesFilter(excluded_quote='USDT',
+                                                   types=['PERPETUAL', 'TRADIFI_PERPETUAL']), 'um'),
     'usdt_deli': (TradingUsdtFuturesFilter(quote_asset='USDT', types=DELIVERY_TYPES), 'um'),
     'usdc_perp': (TradingUsdtFuturesFilter(quote_asset='USDC', types=['PERPETUAL', 'TRADIFI_PERPETUAL']), 'um'),
 

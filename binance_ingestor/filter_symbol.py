@@ -48,6 +48,25 @@ class TradingUsdtFuturesFilter(BaseSymbolFilter):
         return True
 
 
+class TradingOtherQuoteFuturesFilter(BaseSymbolFilter):
+    """USD-M contracts quoted in anything but ``excluded_quote``."""
+
+    def __init__(self, excluded_quote, types):
+        self.excluded_quote = excluded_quote
+        self.contract_types = types
+        if isinstance(types, str):
+            self.contract_types = {types}
+
+    def is_valid(self, x):
+        if x['status'] != 'TRADING':
+            return False
+        if x['quote_asset'] == self.excluded_quote:
+            return False
+        if x['contract_type'] not in self.contract_types:
+            return False
+        return True
+
+
 class TradingCoinFuturesFilter(BaseSymbolFilter):
 
     def __init__(self, types):

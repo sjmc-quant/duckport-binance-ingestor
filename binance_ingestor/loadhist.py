@@ -41,7 +41,7 @@ from binance_ingestor.config import (
 from binance_ingestor.duckport_client import DuckportClient
 from binance_ingestor.hist import (
     need_analyse_set,
-    async_get_usdt_symbols, spot_symbols_filter,
+    async_get_market_symbols, spot_symbols_filter,
     async_get_daily_list, async_get_monthly_list,
     get_download_prefix,
     async_download_file,
@@ -49,10 +49,9 @@ from binance_ingestor.hist import (
     batch_process_data,
     GapRecord, fill_gaps,
 )
+from binance_ingestor.markets import KLINE_MARKETS, VENUE_SPOT, VENUE_UM, venue_of
 from binance_ingestor.utils.log_kit import logger
 from binance_ingestor.utils.timer import timer
-
-KLINE_MARKETS = ('usdt_perp', 'usdt_spot')
 
 # Re-load duck_time - BOUNDARY_DAYS as the starting boundary.
 # The 1-day overlap is deduplicated by the anti-join in bulk_write_kline (idempotent).
@@ -113,12 +112,12 @@ def _download_market(trade_type: str, interval: str) -> GapRecord:
         'delimiter': '/',
         'prefix': get_download_prefix(trade_type, 'klines', 'daily', None, interval),
     }
-    symbols = async_get_usdt_symbols(params)
-    if trade_type == 'usdt_spot':
+    symbols = async_get_market_symbols(trade_type, params)
+    if venue_of(trade_type) == VENUE_SPOT:
         symbols = spot_symbols_filter(symbols)
     logger.info(f'{trade_type} 交易对数量: {len(symbols)}')
 
-    if trade_type == 'usdt_perp':
+    if venue_of(trade_type) == VENUE_UM:
         asyncio.run(_ping_binance())
 
     daily_list   = async_get_daily_list(RESOURCE_PATH, symbols, trade_type, 'klines', interval)
@@ -173,12 +172,9 @@ def run_download(interval: str) -> Dict[str, GapRecord]:
     """Download every enabled market; returns ``{market: GapRecord}`` for Step 3."""
     start = datetime.now()
     records: Dict[str, GapRecord] = {}
-    if 'usdt_perp' in DATA_SOURCES:
-        logger.info('=== 下载期货数据 ===')
-        records['usdt_perp'] = _download_market('usdt_perp', interval)
-    if 'usdt_spot' in DATA_SOURCES:
-        logger.info('=== 下载现货数据 ===')
-        records['usdt_spot'] = _download_market('usdt_spot', interval)
+    for market in get_enabled_kline_markets():
+        logger.info(f'=== 下载 {market} 数据 ===')
+        records[market] = _download_market(market, interval)
     logger.info(f'下载完成，耗时 {(datetime.now() - start).seconds / 60:.1f} 分钟')
     return records
 

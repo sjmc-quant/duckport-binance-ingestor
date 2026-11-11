@@ -1,6 +1,8 @@
 from typing import Tuple
 from abc import ABC, abstractmethod
 
+from binance_ingestor.markets import VENUE_CM, VENUE_SPOT, VENUE_UM, venue_of
+
 from .restful_basics import BinanceBaseApi, proxy
 
 
@@ -106,11 +108,8 @@ class BinanceMarketSpotApi(BinanceBaseMarketApi):
 
 
 def create_binance_market_api(type_, session) -> BinanceBaseMarketApi:
-    if type_ == 'usdt_spot':
-        return BinanceMarketSpotApi(session)
-    elif type_ == 'usdt_perp':
-        return BinanceMarketUMFapi(session)
-    elif type_ == 'coin_perp':
-        return BinanceMarketCMDapi(session)
-    else:
+    try:
+        venue = venue_of(type_)
+    except ValueError:
         raise ValueError(f'Trade type {type_} not supported for Binance market API')
+    return {VENUE_SPOT: BinanceMarketSpotApi, VENUE_UM: BinanceMarketUMFapi, VENUE_CM: BinanceMarketCMDapi}[venue](session)

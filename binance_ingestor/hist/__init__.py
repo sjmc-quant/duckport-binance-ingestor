@@ -26,7 +26,7 @@ __all__ = [
     "create_download_semaphore",
 
     # Symbol management
-    "async_get_all_symbols", "async_get_usdt_symbols", "spot_symbols_filter",
+    "async_get_all_symbols", "async_get_usdt_symbols", "async_get_market_symbols", "spot_symbols_filter",
 
     # Data listing
     "async_get_daily_list", "async_get_monthly_list", "async_get_metrics_list",

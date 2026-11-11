@@ -28,10 +28,8 @@ from binance_ingestor.config import (
 from binance_ingestor.component.candle_fetcher import BinanceFetcher, OptimizedKlineFetcher
 from binance_ingestor.component.candle_listener import MarketListener
 from binance_ingestor.bus import TRADE_TYPE_MAP
+from binance_ingestor.markets import KLINE_MARKETS
 from binance_ingestor.utils.timer import timer, func_timer
-
-KLINE_MARKETS = ('usdt_perp', 'usdt_spot')
-
 
 def get_enabled_kline_markets():
     return [market for market in KLINE_MARKETS if market in DATA_SOURCES]
@@ -79,7 +77,7 @@ class DataJobs:
 
     def init_history_data(self):
         if not self._enabled_kline_markets:
-            logger.info("未启用 usdt_perp/usdt_spot，跳过历史数据初始化")
+            logger.info("未启用任何 K 线市场，跳过历史数据初始化")
             return
 
         logger.info(f"开始初始化历史数据, 数据起始时间为: {START_DATE}")
@@ -166,7 +164,7 @@ class DataJobs:
         divider(f"[Scheduler] next fetch runtime: {next_time:%Y-%m-%d %H:%M:%S}", display_time=False)
         await async_sleep_until_run_time(next_time)
         if not self._enabled_kline_markets:
-            logger.info("[Scheduler] 未启用 usdt_perp/usdt_spot，跳过 periodic fetch")
+            logger.info("[Scheduler] 未启用任何 K 线市场，跳过 periodic fetch")
             return
         try:
             for market in self._enabled_kline_markets:
@@ -350,7 +348,7 @@ class WebsocketsDataJobs(DataJobs):
         async def run_async():
             try:
                 if not self._enabled_kline_markets:
-                    logger.info("未启用 usdt_perp/usdt_spot，跳过 WebSocket 数据收集")
+                    logger.info("未启用任何 K 线市场，跳过 WebSocket 数据收集")
                     return
 
                 market_tasks = [
@@ -382,7 +380,7 @@ class WebsocketsDataJobs(DataJobs):
                 'taker_buy_base_asset_volume': [float(df_candle['taker_buy_base_asset_volume'].iloc[0])],
                 'taker_buy_quote_asset_volume': [float(df_candle['taker_buy_quote_asset_volume'].iloc[0])],
                 'avg_price': [float(df_candle['quote_volume'].iloc[0]) / float(df_candle['volume'].iloc[0]) if float(
-                    df_candle['volume'].iloc[0]) > 0 else 0.0]
+                    df_candle['volume'].iloc[0]) > 0 else float('nan')]  # stored as NULL, like REST and loadhist
             }
 
             return pd.DataFrame(converted_data)
