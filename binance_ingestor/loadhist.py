@@ -8,7 +8,10 @@ Flow:
           the affected months are rebuilt (hist/gap_filler.py)
   Step 2  Incremental clean (skip unchanged files via .ok marker, atomic write)
   Step 3  Incremental load (boundary = duck_time - BOUNDARY_DAYS, anti-join dedup);
-          gap-filled (symbol, day) pairs are loaded even when they lie before the boundary
+          gap-filled (symbol, day) pairs are loaded even when they lie before the boundary.
+          duck_time is set to where every live symbol has rows, not to the newest row:
+          a symbol whose latest daily archive is not published yet is backfilled over
+          REST when the ingestor starts
 
 Assumptions:
   - Data before duck_time is complete and accurate except for the recorded gaps; no other backfill.
@@ -290,6 +293,44 @@ def _gap_predicate(pairs: List[Tuple[str, str]]) -> str:
     return "(" + " OR ".join(parts) + ")"
 
 
+def complete_through(con, files: List[str]) -> Tuple[Optional[datetime], Optional[datetime], List[str]]:
+    """How far the market's Parquet is complete for every symbol still alive.
+
+    Returns ``(complete, newest, behind)``: ``newest`` is the last row of any symbol,
+    ``complete`` the earliest last row among the symbols that have rows on the day before
+    ``newest``, and ``behind`` those of them that stop before ``newest``'s day.
+
+    Binance publishes a day's archives one symbol at a time (around 08:50-09:30 UTC the
+    next day). A run in between has the newest day for some symbols only; the ingestor
+    backfills over REST from ``duck_time`` when it starts, so ``duck_time`` must not lie
+    past a symbol that is still waiting for its archive. Symbols without a row on the day
+    before ``newest`` are delisted or halted and do not hold the watermark back, so
+    ``complete`` is never more than two days behind ``newest``.
+    """
+    recent = [_sql_path(f) for f in sorted(files)[-2:]]     # the previous day may be last month's file
+    if not recent:
+        return None, None, []
+    src = "read_parquet([" + ", ".join(f"'{f}'" for f in recent) + "])"
+    newest = con.execute(f"SELECT max(open_time) FROM {src}").fetchone()[0]
+    if newest is None:
+        return None, None, []
+    newest = newest.replace(tzinfo=None)
+    day = datetime(newest.year, newest.month, newest.day)
+    prev = day - timedelta(days=1)
+    rows = con.execute(f"""
+        SELECT symbol, max(open_time) AS last_row
+        FROM {src}
+        WHERE open_time >= '{prev:%Y-%m-%d %H:%M:%S}'
+        GROUP BY symbol
+        HAVING min(open_time) < '{day:%Y-%m-%d %H:%M:%S}'
+    """).fetchall()
+    last_rows = {symbol: last.replace(tzinfo=None) for symbol, last in rows}
+    if not last_rows:
+        return newest, newest, []
+    behind = sorted(symbol for symbol, last in last_rows.items() if last < day)
+    return min(last_rows.values()), newest, behind
+
+
 def save_to_duckport(
     client: DuckportClient,
     markets: list,
@@ -307,7 +348,8 @@ def save_to_duckport(
 
     Gap-filled days (``gap_records[market]``, status ``downloaded``) lie before the boundary.
     Their files are read anyway with a predicate selecting just those (symbol, day) pairs;
-    once written they are marked ``loaded``. duck_time only ever moves forward.
+    once written they are marked ``loaded``. duck_time only ever moves forward, and only as
+    far as every live symbol has rows (``complete_through``).
     """
     gap_records = gap_records or {}
     for market in markets:
@@ -414,6 +456,22 @@ def save_to_duckport(
                     f"{market}  {os.path.basename(fp)}: +{file_rows:,} rows"
                     f"  (file_max={fm:%Y-%m-%d})"
                 )
+
+            if new_max is not None:
+                complete, newest, behind = complete_through(local_conn, files)
+                if complete is not None and complete < new_max:
+                    if behind:
+                        logger.warning(
+                            f"{market}: {len(behind)} 个 symbol 最新一天（{newest:%Y-%m-%d}）的归档尚未发布: "
+                            f"{', '.join(behind[:10])}{' ...' if len(behind) > 10 else ''}"
+                        )
+                    if ed is None or complete > ed:
+                        logger.info(
+                            f"{market}: duck_time 取所有在交易 symbol 都已导入到的时间 "
+                            f"{complete:%Y-%m-%d %H:%M:%S}（最新一行 {new_max:%Y-%m-%d %H:%M:%S}），"
+                            f"其后由 ingestor 启动时通过 REST 补齐"
+                        )
+                    new_max = complete
 
         finally:
             local_conn.close()
