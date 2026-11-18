@@ -20,7 +20,7 @@ created by older versions that still have the key.
 import json
 import math
 import os
-from datetime import timezone
+from datetime import datetime, timezone
 from importlib import metadata
 from typing import Dict, List, Optional
 
@@ -29,6 +29,10 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.flight as flight
 
+from binance_ingestor.asset_class import (
+    ASSET_COL_DEFS, CONTRACT_TYPE_COL, DEFAULT_CLASS, UNDERLYING_TYPE_COL,
+    AssetClassifier, has_asset_columns,
+)
 from binance_ingestor.utils.log_kit import logger
 
 
@@ -164,6 +168,25 @@ class DuckportClient:
             f"append_max_message_bytes={self.append_max_message_bytes}"
         )
 
+    @classmethod
+    def kline_col_defs(cls, market: str) -> List[str]:
+        """Column definitions of ``market``'s kline table; perpetuals also carry the asset class."""
+        return cls.KLINE_COL_DEFS + (ASSET_COL_DEFS if has_asset_columns(market) else [])
+
+    def set_asset_classifier(self, market: str, classifier: AssetClassifier) -> None:
+        """Give the write path what it needs to fill ``market``'s asset columns."""
+        if not hasattr(self, "_asset_classifiers"):
+            self._asset_classifiers = {}
+        self._asset_classifiers[market] = classifier
+
+    def _stamp_asset_class(self, market: str, data: pa.Table) -> pa.Table:
+        if not has_asset_columns(market):
+            return data
+        classifier = getattr(self, "_asset_classifiers", {}).get(market)
+        if classifier is None:
+            raise RuntimeError(f"{market}: no asset classifier set, cannot fill contract_type / underlying_type")
+        return classifier.stamp(data)
+
     @staticmethod
     def _exginfo_staging(market: str) -> str:
         return f"_staging_exginfo_{market}"
@@ -176,6 +199,9 @@ class DuckportClient:
     def _merge_sql(target: str, staging: str, data: pa.Table) -> Optional[str]:
         """INSERT the staged rows whose (open_time, symbol) is not in ``target`` yet.
 
+        Columns are named, not positional: a table that got its asset columns by
+        ``ALTER TABLE`` and a staging table created later need not agree on their order.
+
         ``data`` must already be what was appended to ``staging`` (see ``_prepare``), so
         its bounds are naive UTC like the stored column. ``DISTINCT ON`` drops duplicates
         inside the batch; the constant time bounds let zonemaps limit the existing-key scan
@@ -187,8 +213,9 @@ class DuckportClient:
         if lo is None or hi is None:
             return None
         return (
-            f"INSERT INTO {target} "
-            f"SELECT s.* FROM (SELECT DISTINCT ON (open_time, symbol) * FROM {staging} "
+            f"INSERT INTO {target} ({', '.join(data.schema.names)}) "
+            f"SELECT {', '.join('s.' + c for c in data.schema.names)} "
+            f"FROM (SELECT DISTINCT ON (open_time, symbol) * FROM {staging} "
             f"WHERE open_time IS NOT NULL) s "
             f"ANTI JOIN (SELECT open_time, symbol FROM {target} "
             f"WHERE open_time BETWEEN TIMESTAMP '{lo:%Y-%m-%d %H:%M:%S.%f}' "
@@ -319,15 +346,23 @@ class DuckportClient:
         ]
 
         start_ts = f"'{start_date} 00:00:00'" if start_date else "NULL"
-        kline_cols = ", ".join(self.KLINE_COL_DEFS)
         ingestor_sql = self._sql_str(self.ingestor)
         for market in markets:
             if market not in data_sources:
                 continue
             target = f"{market}_{interval}"
+            kline_cols = ", ".join(self.kline_col_defs(market))
             stmts += [
                 f"CREATE TABLE IF NOT EXISTS {s}.{target} ({kline_cols})",
-                f"CREATE TABLE IF NOT EXISTS _staging_{target} ({kline_cols})",
+            ] + [
+                # tables older than 0.7.0: existing rows take the default (crypto) and
+                # backfill_asset_columns then corrects the ones that are something else
+                f"ALTER TABLE {s}.{target} ADD COLUMN IF NOT EXISTS {col}"
+                for col in (ASSET_COL_DEFS if has_asset_columns(market) else [])
+            ] + [
+                # recreated, so a staging table from an older version gets the new columns
+                f"DROP TABLE IF EXISTS _staging_{target}",
+                f"CREATE TABLE _staging_{target} ({kline_cols})",
                 # Tells `duckport upgrade` this table's writer no longer needs a key.
                 f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
                 f"VALUES ('write_mode:{target}', 'anti_join')",
@@ -363,13 +398,16 @@ class DuckportClient:
         self.execute_transaction(stmts)
         logger.info(f"Schema '{s}' initialised on duckport-rs")
 
-        kline_columns = dict(c.split(" ", 1) for c in self.KLINE_COL_DEFS)
         specs = [
             self._spec_sql(
-                f"{market}_{interval}", kind="append", columns=kline_columns,
+                f"{market}_{interval}", kind="append",
+                columns={c.split()[0]: c.split()[1] for c in self.kline_col_defs(market)},
                 dedup_key=["open_time", "symbol"], time_column="open_time",
                 period_seconds=self._interval_seconds(interval),
                 string_checks={"symbol": {"max_len": 40}},
+                column_defaults=({CONTRACT_TYPE_COL: f"'{DEFAULT_CLASS[0]}'",
+                                  UNDERLYING_TYPE_COL: f"'{DEFAULT_CLASS[1]}'"}
+                                 if has_asset_columns(market) else None),
             )
             for market in markets if market in data_sources
         ]
@@ -456,6 +494,7 @@ class DuckportClient:
             df["open_time"] = df["open_time"].dt.tz_localize(None)
 
         arrow_table = self._prepare(pa.Table.from_pandas(df, preserve_index=False))
+        arrow_table = self._stamp_asset_class(market, arrow_table)
 
         self.execute(f"TRUNCATE {staging}")
         append_resp = self.append("main", staging, arrow_table)
@@ -509,7 +548,7 @@ class DuckportClient:
         s = self.schema
         target = f"{s}.{market}_{interval}"
         staging = f"_staging_{market}_{interval}"
-        arrow_table = self._prepare(arrow_table)
+        arrow_table = self._stamp_asset_class(market, self._prepare(arrow_table))
         total = len(arrow_table)
         row_chunk_size = self._append_max_rows_per_message(arrow_table, chunk_size)
 
@@ -534,6 +573,55 @@ class DuckportClient:
             f"duck_time={'synced' if sync_duck_time else 'deferred'} ({duck_time_str})"
         )
         return {"total_rows": total}
+
+    def backfill_asset_columns(self, market: str, interval: str) -> Optional[int]:
+        """Set the asset columns of the rows written before the columns existed. Runs once.
+
+        ``init_schema`` added the columns with the crypto default, so only the rows of the
+        classifier's non-default periods are updated. Must not run again later: rows
+        written live hold the values of their own time, which the rule cannot reproduce
+        after a contract changes type. ``config_dict`` records that it is done.
+        Returns the number of rows updated, or None when there was nothing to do.
+        """
+        if not has_asset_columns(market):
+            return None
+        s = self.schema
+        table = f"{market}_{interval}"
+        key = f"asset_columns_backfilled:{table}"
+        config = self.read_table(s, "config_dict").to_pandas()
+        if (config["key"] == key).any():
+            return None
+        classifier = getattr(self, "_asset_classifiers", {}).get(market)
+        if classifier is None:
+            raise RuntimeError(f"{market}: no asset classifier set, cannot backfill")
+
+        def ts(value):
+            return f"TIMESTAMP '{value:%Y-%m-%d %H:%M:%S}'"
+
+        segments = classifier.all_segments()
+        stmts = []
+        if segments:
+            values = ", ".join(
+                f"({self._sql_str(symbol)}, {ts(lo)}, {ts(hi)}, {self._sql_str(contract_type)}, "
+                f"{self._sql_str(underlying) if underlying else 'CAST(NULL AS VARCHAR)'})"
+                for symbol, lo, hi, contract_type, underlying in segments
+            )
+            # the constant lower bound lets zonemaps skip everything older than the first period
+            stmts.append(
+                f"UPDATE {s}.{table} AS t SET {CONTRACT_TYPE_COL} = v.contract_type, "
+                f"{UNDERLYING_TYPE_COL} = v.underlying_type "
+                f"FROM (VALUES {values}) v(symbol, lo, hi, contract_type, underlying_type) "
+                f"WHERE t.open_time >= {ts(min(seg[1] for seg in segments))} "
+                f"AND t.symbol = v.symbol AND t.open_time >= v.lo AND t.open_time < v.hi"
+            )
+        stmts.append(
+            f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
+            f"VALUES ('{key}', '{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}')"
+        )
+        resp = self.execute_transaction(stmts)
+        updated = resp.get("rows_affected") if isinstance(resp, dict) else None
+        logger.info(f"backfill_asset_columns: {table}, {len(segments)} periods, rows_affected={updated}")
+        return updated
 
     def save_exginfo(self, df: pd.DataFrame, market: str):
         s = self.schema

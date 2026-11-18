@@ -17,6 +17,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
+from binance_ingestor.asset_class import AssetClassifier, has_asset_columns
 from binance_ingestor.duckport_client import DuckportClient
 from binance_ingestor.utils import next_run_time, async_sleep_until_run_time, now_time, create_aiohttp_session
 from binance_ingestor.utils.log_kit import logger, divider
@@ -52,6 +53,7 @@ class DataJobs:
 
         # In-memory exginfo cache (market -> DataFrame)
         self.exginfo: Dict[str, pd.DataFrame] = {}
+        self._asset_classifiers: Dict[str, AssetClassifier] = {}
 
         logger.info(f'binance ingestor 启用市场: {self._enabled_kline_markets}')
 
@@ -89,7 +91,9 @@ class DataJobs:
                 fetchers = {}
                 for market in self._enabled_kline_markets:
                     fetchers[market] = BinanceFetcher(market, session)
-                    await fetchers[market].get_exchange_info()
+                    self._update_asset_classifier(market, await fetchers[market].get_exchange_info())
+                    # before the first write of this version: see backfill_asset_columns
+                    self._client.backfill_asset_columns(market, KLINE_INTERVAL)
 
                 for market in self._enabled_kline_markets:
                     if latest_times[market] and latest_times[market] != GENESIS_TIME:
@@ -133,6 +137,17 @@ class DataJobs:
         df = df[df['open_time'] < current_time]
         self.write_kline(df, market, current_time)
 
+    def _update_asset_classifier(self, market, exginfo):
+        """Keep the client's classifier for ``market`` in step with exchangeInfo."""
+        if not has_asset_columns(market):
+            return
+        classifier = self._asset_classifiers.get(market)
+        if classifier is None:
+            classifier = self._asset_classifiers[market] = AssetClassifier(market, exginfo)
+            self._client.set_asset_classifier(market, classifier)
+        else:
+            classifier.update(exginfo)
+
     # ── Write operations ────────────────────────────────────────────
 
     def write_kline(self, df, market, current_time):
@@ -144,6 +159,7 @@ class DataJobs:
     @func_timer
     async def save_exginfo(self, fetcher, market):
         exginfo = await fetcher.get_exchange_info()
+        self._update_asset_classifier(market, exginfo)
         symbols_trading = TRADE_TYPE_MAP[market][0](exginfo)
         infos_trading = [info for sym, info in exginfo.items() if sym in symbols_trading]
         symbols_trading_df = pd.DataFrame.from_records(infos_trading)
