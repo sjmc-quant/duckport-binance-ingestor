@@ -43,7 +43,10 @@ def _parse_usdt_futures_syminfo(info, market='usdt_perp'):
         'price_tick': Decimal(price_tick),
         'lot_size': Decimal(lot_size),
         'min_notional_value': Decimal(min_notional),
-        'pre_market': None
+        'pre_market': None,
+        # reset by Binance when a symbol name is listed again; not an exginfo column
+        'onboard_time': (pd.to_datetime(info['onboardDate'], unit='ms')
+                         if info.get('onboardDate') else None),
     }
 
 def _parse_coin_futures_syminfo(info, market='coin_perp'):

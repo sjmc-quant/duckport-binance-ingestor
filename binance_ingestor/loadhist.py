@@ -2,7 +2,7 @@
 Historical kline bulk loader — v2
 
 Flow:
-  Step 0  ping + init_schema
+  Step 0  ping + init_schema; exchangeInfo for the perpetuals' asset columns
   Step 1  Download monthly/daily zips → convert to Parquet
   Step 1b Gap fill: days missing from the monthly archives are fetched as daily zips,
           the affected months are rebuilt (hist/gap_filler.py)
@@ -41,6 +41,8 @@ from binance_ingestor.config import (
     DUCKPORT_ADDR, DUCKPORT_SCHEMA, RESOURCE_PATH,
     START_DATE, proxy,
 )
+from binance_ingestor.asset_class import AssetClassifier, has_asset_columns
+from binance_ingestor.component.candle_fetcher import BinanceFetcher
 from binance_ingestor.duckport_client import DuckportClient
 from binance_ingestor.hist import (
     need_analyse_set,
@@ -53,6 +55,7 @@ from binance_ingestor.hist import (
     GapRecord, fill_gaps,
 )
 from binance_ingestor.markets import KLINE_MARKETS, VENUE_SPOT, VENUE_UM, venue_of
+from binance_ingestor.utils import create_aiohttp_session
 from binance_ingestor.utils.log_kit import logger
 from binance_ingestor.utils.timer import timer
 
@@ -89,6 +92,22 @@ def init_remote_schema(client: DuckportClient):
         start_date=START_DATE,
     )
     client.verify_kline_interval(KLINE_INTERVAL)
+
+
+def prepare_asset_columns(client: DuckportClient, markets: list) -> None:
+    """Perpetual rows carry contract_type / underlying_type (``asset_class``): load each
+    market's exchangeInfo for the classifier, and fill the rows older than the columns."""
+    markets = [m for m in markets if has_asset_columns(m)]
+    if not markets:
+        return
+
+    async def exchange_infos():
+        async with create_aiohttp_session(10) as session:
+            return {m: await BinanceFetcher(m, session).get_exchange_info() for m in markets}
+
+    for market, exginfo in asyncio.run(exchange_infos()).items():
+        client.set_asset_classifier(market, AssetClassifier(market, exginfo))
+        client.backfill_asset_columns(market, KLINE_INTERVAL)
 
 
 # ── Step 1: download ──────────────────────────────────────────────────
@@ -505,6 +524,7 @@ def main():
 
     logger.info("初始化远程 schema ...")
     init_remote_schema(client)
+    prepare_asset_columns(client, get_enabled_kline_markets())
 
     # Step 1 (+1b gap fill): download
     logger.info("--- Step 1: 下载 ---")
