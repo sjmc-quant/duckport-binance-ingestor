@@ -174,6 +174,9 @@ class RecordingClient(DuckportClient):
         self.sent.append(("execute", sql))
         return {}
 
+    def _query(self, sql):
+        return pa.table({"cols": pa.array([None], pa.string())})      # no such table yet
+
     def execute_transaction(self, statements):
         self.sent.append(("tx", list(statements)))
         return {}

@@ -133,6 +133,7 @@ class LocalClient(DuckportClient):
     def __init__(self):
         self.schema, self.interval, self.ingestor, self.max_lag_seconds = "data", "1m", "test", 900
         self.append_max_message_bytes = 48 * 1024 * 1024
+        self.transactions = []
         self.con = duckdb.connect()
         self.con.execute("CREATE SCHEMA data")
         self.con.execute("CREATE TABLE data.watermark (table_name VARCHAR PRIMARY KEY, ingestor VARCHAR, "
@@ -143,15 +144,21 @@ class LocalClient(DuckportClient):
         return {"rows_affected": self.con.execute(sql).fetchall()}
 
     def execute_transaction(self, statements):
+        self.transactions.append(statements)
         self.con.execute("BEGIN")
         try:
+            affected = []
             for sql in statements:
-                self.con.execute(sql)
+                done = self.con.execute(sql)
+                affected.append(done.fetchall()[0][0] if sql.startswith(("UPDATE", "DELETE")) else 0)
             self.con.execute("COMMIT")
         except Exception:
             self.con.execute("ROLLBACK")
             raise
-        return {}
+        return {"rows_affected": affected}
+
+    def _query(self, sql):
+        return self.con.execute(sql).to_arrow_table()
 
     def append(self, schema, table, data):
         self.con.register("incoming", data)
@@ -246,6 +253,77 @@ def test_backfill_runs_once():
         "usdt_perp", {**EXGINFO, "PREDICTUSDT": info("PERPETUAL", "COIN", "2026-10-25 08:15")}))
     assert client.backfill_asset_columns("usdt_perp", "1m") is None
     assert client.rows("SELECT underlying_type FROM data.usdt_perp_1m") == [("PREMARKET",)]
+
+
+def backfill_table(client):
+    """A 0.6.0 table with three days of a TradFi contract and of a crypto one, upgraded."""
+    old_cols = ", ".join(DuckportClient.KLINE_COL_DEFS)
+    client.con.execute(f"CREATE TABLE data.usdt_perp_1m ({old_cols})")
+    days = ["2026-03-01 12:00", "2026-03-02 12:00", "2026-03-03 23:59"]
+    old = pd.concat([candles("XAUUSDT", *days), candles("BTCUSDT", *days)])      # noqa: F841
+    client.con.execute("INSERT INTO data.usdt_perp_1m SELECT * FROM old")
+    init(client)
+    client.set_asset_classifier("usdt_perp", AssetClassifier("usdt_perp", EXGINFO))
+
+
+def updates(client):
+    return [tx for tx in client.transactions if tx[0].startswith("UPDATE")]
+
+
+def test_backfill_is_one_transaction_per_day():
+    """One UPDATE over a whole table filled the temp directory of a small machine."""
+    client = LocalClient()
+    backfill_table(client)
+    assert client.backfill_asset_columns("usdt_perp", "1m") == 3
+    batches = updates(client)
+    assert len(batches) == 3
+    for day, (update, progress) in zip(("01", "02", "03"), batches):
+        assert f"t.open_time >= TIMESTAMP '2026-03-{day} 00:00:00' AND t.open_time < " in update
+        assert "asset_columns_backfill_upto:usdt_perp_1m" in progress
+    assert client.rows("SELECT symbol, count(*) FROM data.usdt_perp_1m "
+                       "WHERE contract_type = 'TRADIFI_PERPETUAL' GROUP BY 1") == [("XAUUSDT", 3)]
+    assert client.rows("SELECT key FROM data.config_dict WHERE key LIKE 'asset_columns%'") == [
+        ("asset_columns_backfilled:usdt_perp_1m",)]
+
+
+def test_backfill_goes_on_where_an_interrupted_run_stopped():
+    client = LocalClient()
+    backfill_table(client)
+    real = client.execute_transaction
+
+    def fails_on_the_third_day(statements):
+        if "TIMESTAMP '2026-03-03 00:00:00' AND t.open_time <" in statements[0]:
+            raise RuntimeError("Out of Memory Error")
+        return real(statements)
+    client.execute_transaction = fails_on_the_third_day
+    with pytest.raises(RuntimeError, match="Out of Memory"):
+        client.backfill_asset_columns("usdt_perp", "1m")
+    assert client.rows("SELECT value FROM data.config_dict WHERE key LIKE 'asset_columns%'") == [
+        ("2026-03-03 00:00:00",)]
+
+    client.execute_transaction = real
+    client.transactions.clear()
+    assert client.backfill_asset_columns("usdt_perp", "1m") == 1
+    assert len(updates(client)) == 1
+    assert client.rows("SELECT count(*) FROM data.usdt_perp_1m WHERE underlying_type = 'COMMODITY'") == [(3,)]
+    assert client.backfill_asset_columns("usdt_perp", "1m") is None
+
+
+def test_columns_are_added_one_at_a_time_with_a_checkpoint():
+    client = LocalClient()
+    calls = []
+    real = client.execute
+    client.execute = lambda sql: calls.append(sql.split(" DEFAULT")[0]) or real(sql)
+    old_cols = ", ".join(DuckportClient.KLINE_COL_DEFS)
+    client.con.execute(f"CREATE TABLE data.usdt_perp_1m ({old_cols})")
+    init(client)
+    assert calls == ["ALTER TABLE data.usdt_perp_1m ADD COLUMN IF NOT EXISTS contract_type VARCHAR", "CHECKPOINT",
+                     "ALTER TABLE data.usdt_perp_1m ADD COLUMN IF NOT EXISTS underlying_type VARCHAR", "CHECKPOINT"]
+    calls.clear()
+    # nothing to add any more, and a new table is created with the columns
+    init(client, sources=("usdt_perp", "others_perp"))
+    assert calls == []
+    assert columns(client, "others_perp_1m")[-2:] == ["contract_type", "underlying_type"]
 
 
 def test_bulk_write_stamps_and_spot_is_untouched():

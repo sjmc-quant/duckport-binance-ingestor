@@ -20,7 +20,7 @@ created by older versions that still have the key.
 import json
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib import metadata
 from typing import Dict, List, Optional
 
@@ -46,6 +46,9 @@ def _resolve_token(token: Optional[str]) -> str:
     if token is not None:
         return token
     return os.getenv("DUCKPORT_TOKEN", "")
+
+# open_time covered by one transaction of backfill_asset_columns
+ASSET_BACKFILL_WINDOW = timedelta(days=1)
 
 
 class _BearerMiddleware(flight.ClientMiddleware):
@@ -319,6 +322,24 @@ class DuckportClient:
         writer.close()
         return resp
 
+    def _checkpoint(self) -> None:
+        """Have the server write committed changes into the database file. A column added
+        to a table stays in memory (and spills to the temp directory) until then."""
+        try:
+            self.execute("CHECKPOINT")
+        except Exception as e:
+            logger.warning(f"CHECKPOINT failed, going on: {e}")
+
+    def _query(self, sql: str) -> pa.Table:
+        """Result of one SELECT (duckport.query)."""
+        ticket = flight.Ticket(json.dumps({"type": "duckport.query", "sql": sql}).encode("utf-8"))
+        try:
+            reader = self.client.do_get(ticket)
+        except flight.FlightUnavailableError:
+            self._reconnect()
+            reader = self.client.do_get(ticket)
+        return reader.read_all()
+
     def read_table(self, schema: str, table: str) -> pa.Table:
         ticket_json = json.dumps({"schema": schema, "table": table}).encode("utf-8")
         try:
@@ -352,14 +373,10 @@ class DuckportClient:
                 continue
             target = f"{market}_{interval}"
             kline_cols = ", ".join(self.kline_col_defs(market))
+            if has_asset_columns(market):
+                self._add_asset_columns(target)
             stmts += [
                 f"CREATE TABLE IF NOT EXISTS {s}.{target} ({kline_cols})",
-            ] + [
-                # tables older than 0.7.0: existing rows take the default (crypto) and
-                # backfill_asset_columns then corrects the ones that are something else
-                f"ALTER TABLE {s}.{target} ADD COLUMN IF NOT EXISTS {col}"
-                for col in (ASSET_COL_DEFS if has_asset_columns(market) else [])
-            ] + [
                 # recreated, so a staging table from an older version gets the new columns
                 f"DROP TABLE IF EXISTS _staging_{target}",
                 f"CREATE TABLE _staging_{target} ({kline_cols})",
@@ -420,6 +437,27 @@ class DuckportClient:
             column_defaults={"created_time": "CURRENT_TIMESTAMP"},
         ))
         self.register_table_specs(specs)
+
+    def _add_asset_columns(self, target: str) -> None:
+        """Add the asset columns to a kline table older than 0.7.0. Existing rows take the
+        default (crypto); backfill_asset_columns then corrects the ones that are something else.
+
+        One column at a time with a checkpoint after each: DuckDB holds a new column
+        uncompressed (about 10 bytes per row, in memory and then in the temp directory)
+        until it is checkpointed. Both columns in one transaction need twice that.
+        """
+        found = self._query(
+            "SELECT string_agg(column_name, ',') AS cols FROM information_schema.columns "
+            f"WHERE table_schema = '{self.schema}' AND table_name = '{target}'"
+        ).to_pylist()
+        existing = set((found[0]["cols"] or "").split(",")) if found else set()
+        if "open_time" not in existing:
+            return      # no table yet: init_schema creates it with the columns
+        for col in ASSET_COL_DEFS:
+            if col.split()[0] not in existing:
+                logger.info(f"adding column to {self.schema}.{target}: {col}")
+                self.execute(f"ALTER TABLE {self.schema}.{target} ADD COLUMN IF NOT EXISTS {col}")
+                self._checkpoint()
 
     def _spec_sql(self, table, kind, columns, dedup_key, time_column=None, period_seconds=None,
                   string_checks=None, column_defaults=None, legacy_columns=()) -> str:
@@ -581,15 +619,21 @@ class DuckportClient:
         classifier's non-default periods are updated. Must not run again later: rows
         written live hold the values of their own time, which the rule cannot reproduce
         after a contract changes type. ``config_dict`` records that it is done.
-        Returns the number of rows updated, or None when there was nothing to do.
+
+        One transaction per ``ASSET_BACKFILL_WINDOW`` of ``open_time``: one statement for
+        the 50M TradFi rows of a 300M-row table wrote 26 GB into the server's temp directory
+        (memory_limit 2GB) and filled the disk of a small machine. ``config_dict`` also
+        records how far it got, and a run that was interrupted goes on from there.
+        Returns the number of rows updated, or None when it was already done.
         """
         if not has_asset_columns(market):
             return None
         s = self.schema
         table = f"{market}_{interval}"
-        key = f"asset_columns_backfilled:{table}"
+        done_key = f"asset_columns_backfilled:{table}"
+        upto_key = f"asset_columns_backfill_upto:{table}"
         config = self.read_table(s, "config_dict").to_pandas()
-        if (config["key"] == key).any():
+        if (config["key"] == done_key).any():
             return None
         classifier = getattr(self, "_asset_classifiers", {}).get(market)
         if classifier is None:
@@ -598,29 +642,50 @@ class DuckportClient:
         def ts(value):
             return f"TIMESTAMP '{value:%Y-%m-%d %H:%M:%S}'"
 
+        def upsert(key, value):
+            return (f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
+                    f"VALUES ('{key}', '{value:%Y-%m-%d %H:%M:%S}')")
+
         segments = classifier.all_segments()
-        stmts = []
-        if segments:
-            values = ", ".join(
-                f"({self._sql_str(symbol)}, {ts(lo)}, {ts(hi)}, {self._sql_str(contract_type)}, "
-                f"{self._sql_str(underlying) if underlying else 'CAST(NULL AS VARCHAR)'})"
-                for symbol, lo, hi, contract_type, underlying in segments
-            )
-            # the constant lower bound lets zonemaps skip everything older than the first period
-            stmts.append(
-                f"UPDATE {s}.{table} AS t SET {CONTRACT_TYPE_COL} = v.contract_type, "
-                f"{UNDERLYING_TYPE_COL} = v.underlying_type "
-                f"FROM (VALUES {values}) v(symbol, lo, hi, contract_type, underlying_type) "
-                f"WHERE t.open_time >= {ts(min(seg[1] for seg in segments))} "
-                f"AND t.symbol = v.symbol AND t.open_time >= v.lo AND t.open_time < v.hi"
-            )
-        stmts.append(
-            f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
-            f"VALUES ('{key}', '{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}')"
-        )
-        resp = self.execute_transaction(stmts)
-        updated = resp.get("rows_affected") if isinstance(resp, dict) else None
-        logger.info(f"backfill_asset_columns: {table}, {len(segments)} periods, rows_affected={updated}")
+        span = self._query(f"SELECT min(open_time) AS lo, max(open_time) AS hi FROM {s}.{table}").to_pylist()
+        first, last = (span[0]["lo"], span[0]["hi"]) if span else (None, None)
+        updated = batches = 0
+        if segments and first is not None:
+            lo = max(first, min(seg[1] for seg in segments))
+            resumed = config.loc[config["key"] == upto_key, "value"]
+            if len(resumed):
+                lo = max(lo, datetime.strptime(resumed.iloc[0], "%Y-%m-%d %H:%M:%S"))
+                logger.info(f"backfill_asset_columns: {table} continues from {lo}")
+            lo = datetime.combine(lo.date(), datetime.min.time())
+            while lo <= last:
+                hi = lo + ASSET_BACKFILL_WINDOW
+                values = ", ".join(
+                    f"({self._sql_str(symbol)}, {ts(max(seg_lo, lo))}, {ts(min(seg_hi, hi))}, "
+                    f"{self._sql_str(contract_type)}, "
+                    f"{self._sql_str(underlying) if underlying else 'CAST(NULL AS VARCHAR)'})"
+                    for symbol, seg_lo, seg_hi, contract_type, underlying in segments
+                    if seg_lo < hi and seg_hi > lo
+                )
+                if values:
+                    # constant bounds: zonemaps limit the scan to this window
+                    resp = self.execute_transaction([
+                        f"UPDATE {s}.{table} AS t SET {CONTRACT_TYPE_COL} = v.contract_type, "
+                        f"{UNDERLYING_TYPE_COL} = v.underlying_type "
+                        f"FROM (VALUES {values}) v(symbol, lo, hi, contract_type, underlying_type) "
+                        f"WHERE t.open_time >= {ts(lo)} AND t.open_time < {ts(hi)} "
+                        f"AND t.symbol = v.symbol AND t.open_time >= v.lo AND t.open_time < v.hi",
+                        upsert(upto_key, hi),
+                    ])
+                    rows = resp.get("rows_affected") if isinstance(resp, dict) else None
+                    updated += rows[0] if rows else 0
+                    batches += 1
+                lo = hi
+        self.execute_transaction([
+            upsert(done_key, datetime.now(timezone.utc)),
+            f"DELETE FROM {s}.config_dict WHERE key = '{upto_key}'",
+        ])
+        logger.info(f"backfill_asset_columns: {table}, {len(segments)} periods, "
+                    f"{batches} batches, rows_affected={updated}")
         return updated
 
     def save_exginfo(self, df: pd.DataFrame, market: str):
