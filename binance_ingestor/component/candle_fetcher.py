@@ -47,6 +47,10 @@ def _parse_usdt_futures_syminfo(info, market='usdt_perp'):
         # reset by Binance when a symbol name is listed again; not an exginfo column
         'onboard_time': (pd.to_datetime(info['onboardDate'], unit='ms')
                          if info.get('onboardDate') else None),
+        # when a delisted contract is settled; far in the future while it trades.
+        # Not an exginfo column
+        'delivery_time': (pd.to_datetime(info['deliveryDate'], unit='ms', utc=True)
+                          if info.get('deliveryDate') else None),
     }
 
 def _parse_coin_futures_syminfo(info, market='coin_perp'):
