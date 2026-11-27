@@ -131,7 +131,7 @@ class MarketListener:
 
     def __init__(self, market='usdt_perp', data_callback=None, exginfo_callback=None,
                  remedy_callback=None, full_remedy_callback=None, gap_callback=None,
-                 remedy_wait_sec=BATCH_REMEDY_WAIT_SEC):
+                 remedy_wait_sec=BATCH_REMEDY_WAIT_SEC, edge_callback=None):
         self.main_queue = asyncio.Queue()
         self.market = market
         self.listeners = {}
@@ -145,6 +145,7 @@ class MarketListener:
         self.full_remedy_callback = full_remedy_callback
         self.gap_callback = gap_callback
         self.remedy_wait_sec = remedy_wait_sec
+        self.edge_callback = edge_callback
 
     async def build_and_run(self):
         if self.symbols is None:
@@ -383,6 +384,13 @@ class MarketListener:
                 listener.reconnect()
 
         self.symbols = set(symbols_trading)
+
+        if self.edge_callback:
+            # every round, not only when the set changed: edges are followed for a few bars
+            try:
+                await self.edge_callback(self.market, onboard, delist)
+            except Exception as e:
+                logger.error(f'[{self.market}] listing edge fill failed: {e}')
 
     @staticmethod
     def create_listeners(market, symbols, que) -> dict[int, CandleListener]:

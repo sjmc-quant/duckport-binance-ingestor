@@ -32,6 +32,18 @@ from binance_ingestor.bus import TRADE_TYPE_MAP
 from binance_ingestor.markets import KLINE_MARKETS
 from binance_ingestor.utils.timer import timer, func_timer
 
+# Bars a listing or delisting edge is followed for after it is seen (or, for a settling
+# contract, after its delivery time), so a late market batch cannot leave a hole.
+EDGE_FOLLOW_BARS = 3
+# Closed bars asked for per edge symbol. A new symbol is seen within two bars of its
+# first trade, so this is ample.
+EDGE_FETCH_LIMIT = 99
+# A contract is followed as settling only when its delivery is this near. A contract
+# that is not trading yet (PENDING_TRADING) carries a delivery time decades away, and
+# REST refuses its klines.
+EDGE_SETTLE_AHEAD = timedelta(days=1)
+
+
 def get_enabled_kline_markets():
     return [market for market in KLINE_MARKETS if market in DATA_SOURCES]
 
@@ -54,6 +66,10 @@ class DataJobs:
         # In-memory exginfo cache (market -> DataFrame)
         self.exginfo: Dict[str, pd.DataFrame] = {}
         self._asset_classifiers: Dict[str, AssetClassifier] = {}
+        # market -> symbol -> delivery time, for contracts that left TRADING to be settled
+        self._settling: Dict[str, Dict[str, pd.Timestamp]] = {}
+        # market -> symbol -> (no bars at or after, follow until); see _fill_listing_edges
+        self._edge_follow: Dict[str, Dict[str, tuple]] = {}
 
         logger.info(f'binance ingestor 启用市场: {self._enabled_kline_markets}')
 
@@ -161,6 +177,7 @@ class DataJobs:
         exginfo = await fetcher.get_exchange_info()
         self._update_asset_classifier(market, exginfo)
         symbols_trading = TRADE_TYPE_MAP[market][0](exginfo)
+        self._settling[market] = self._settling_symbols(market, exginfo)
         infos_trading = [info for sym, info in exginfo.items() if sym in symbols_trading]
         symbols_trading_df = pd.DataFrame.from_records(infos_trading)
 
@@ -172,6 +189,91 @@ class DataJobs:
         except Exception as e:
             logger.error(f"保存symbols_trading数据失败: {e}")
         return symbols_trading
+
+    # ── Listing and delisting edges ─────────────────────────────────
+
+    @staticmethod
+    def _settling_symbols(market, exginfo) -> Dict[str, pd.Timestamp]:
+        """Contracts of ``market`` that are no longer TRADING and have a delivery time.
+
+        Binance moves a delisted perpetual to SETTLING about 30 minutes before delivery
+        and it keeps trading (reduce-only) until then. The symbol leaves the trading
+        set, and with it the websocket subscription, at the status change.
+        """
+        symbol_filter = TRADE_TYPE_MAP[market][0]
+        settling = {}
+        for symbol, info in exginfo.items():
+            delivery = info.get('delivery_time')
+            if delivery is None or pd.isna(delivery) or info.get('status') == 'TRADING':
+                continue
+            if symbol_filter.is_valid({**info, 'status': 'TRADING'}):
+                settling[symbol] = delivery
+        return settling
+
+    async def _fill_listing_edges(self, market, onboard, delist):
+        """Write over REST the closed bars the websocket does not deliver at a listing
+        or delisting. Called once per bar, after the subscription set was updated.
+
+        - A new symbol is subscribed only after exchangeInfo shows it TRADING, so its
+          first bar closes before the subscription exists.
+        - A delisted contract leaves the trading set when it turns SETTLING and trades
+          until delivery; bars at or after the delivery time are flat and not written.
+        - Any other symbol that left the set is followed for its last closed bars.
+
+        Only bars already covered by the watermark are written, and the watermark is
+        left where it is. The merge skips rows the table already has.
+        """
+        interval = timedelta(minutes=KLINE_INTERVAL_MINUTES)
+        now = pd.Timestamp(now_time()).floor(f'{KLINE_INTERVAL_MINUTES}min')
+        keep = EDGE_FOLLOW_BARS * interval
+        follow = self._edge_follow.setdefault(market, {})
+        for symbol in onboard:
+            follow[symbol] = (None, now + keep)
+        for symbol in delist:
+            follow[symbol] = (now, now + keep)
+        for symbol, delivery in self._settling.get(market, {}).items():
+            if delivery - EDGE_SETTLE_AHEAD <= now <= delivery + keep:
+                follow[symbol] = (delivery, delivery + keep)
+        for symbol in [s for s, (_, until) in follow.items() if now > until]:
+            del follow[symbol]
+        if not follow:
+            return
+
+        async with create_aiohttp_session(10) as session:
+            fetcher = OptimizedKlineFetcher(BinanceFetcher(market, session), max_concurrent=FETCH_CONCURRENCY)
+            tasks = [asyncio.ensure_future(
+                         fetcher.get_klines_with_retry(symbol=s, interval=KLINE_INTERVAL, limit=EDGE_FETCH_LIMIT))
+                     for s in sorted(follow)]
+            try:
+                await asyncio.wait(tasks, timeout=BATCH_REMEDY_FETCH_SEC)
+            finally:
+                pending = [t for t in tasks if not t.done()]
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+            results = [t.result() for t in tasks if not t.cancelled() and t.exception() is None]
+
+        # read the watermark only now: the market batch may have been written meanwhile
+        duck_time = self.duck_time[market]
+        if duck_time == GENESIS_TIME:
+            return
+        frames = []
+        for r in results:
+            if not r.get('success') or r['symbol'] not in follow:
+                continue
+            end = follow[r['symbol']][0]
+            before = duck_time if end is None else min(end, duck_time)
+            df = r['data'][r['data']['open_time'] < before]
+            if not df.empty:
+                frames.append(df)
+        if not frames:
+            return
+        df = pd.concat(frames, ignore_index=True)
+        resp = self._client.write_kline(df, market, KLINE_INTERVAL, duck_time)
+        added = (resp or {}).get('rows_affected', [None])[0]
+        if added:
+            logger.warning(f"[{market}] listing edge: {added} bars written over REST for {sorted(follow)}")
 
     # ── Periodic fetch ──────────────────────────────────────────────
 
@@ -269,6 +371,7 @@ class WebsocketsDataJobs(DataJobs):
                     market=market,
                     data_callback=data_callback,
                     exginfo_callback=self.save_exginfo,
+                    edge_callback=self._fill_listing_edges,
                 )
                 if ENABLE_BATCH_REMEDY:
                     async def full_remedy_callback(run_time: datetime, _market: str):
